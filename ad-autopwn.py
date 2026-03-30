@@ -1002,17 +1002,19 @@ def try_crack_hashes(cfg: Config) -> Optional[tuple[str, str, str]]:
         if cracked_file.exists() and cracked_file.stat().st_size > 0:
             ok("⚡ Quick-crack hit! Username-based password found")
 
-    # Find wordlist
+    # Find wordlist (prefer uncompressed, auto-decompress .gz)
     wordlist = None
     for wl in WORDLISTS:
-        if wl.exists():
+        if wl.exists() and wl.suffix != ".gz":
             wordlist = wl
             break
-        # Decompress .gz
         if wl.suffix == ".gz" and wl.exists():
+            plain = wl.with_suffix("")
+            if plain.exists():
+                wordlist = plain
+                break
             log.info(f"📦 Decompressing {wl.name}...")
             run(["gunzip", "-k", str(wl)], cfg)
-            plain = wl.with_suffix("")
             if plain.exists():
                 wordlist = plain
                 break
@@ -2825,7 +2827,7 @@ def _crack_roast_hashes(hashfile: Path, mode: int, label: str, cfg: Config) -> l
 
     cracked_file = hashfile.parent / f"{hashfile.stem}-cracked.txt"
 
-    # Find wordlist
+    # Find wordlist (prefer uncompressed, auto-decompress .gz)
     wordlist = None
     for wl in WORDLISTS:
         if wl.exists() and wl.suffix != ".gz":
@@ -2833,6 +2835,11 @@ def _crack_roast_hashes(hashfile: Path, mode: int, label: str, cfg: Config) -> l
             break
         if wl.suffix == ".gz" and wl.exists():
             plain = wl.with_suffix("")
+            if plain.exists():
+                wordlist = plain
+                break
+            log.info(f"📦 Decompressing {wl.name}...")
+            run(["gunzip", "-k", str(wl)], cfg, timeout=60)
             if plain.exists():
                 wordlist = plain
                 break
