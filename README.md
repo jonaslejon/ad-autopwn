@@ -9,7 +9,7 @@ A fully automated penetration testing tool that chains 19 attack techniques to c
       /_\ |   \    /_\ _  _| |_ ___| _ \__ __ ___ _
      / _ \| |) |  / _ \ || |  _/ _ \  _/\ V  V / ' \
     /_/ \_\___/  /_/ \_\_,_|\__\___/_|   \_/\_/|_||_|
-    
+
     ⚡ Zero-Auth to Domain Admin — Attack Chain
     ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast | RBCD | GPO | DCSync
 ```
@@ -23,6 +23,8 @@ A fully automated penetration testing tool that chains 19 attack techniques to c
 - **WSUS relay** — intercept Windows Update NTLM auth (port 8530/8531)
 - **PXE boot credential theft** — extract creds from boot images via TFTP
 - **NTLM theft file drops** — .library-ms / .theme / .url files on writable shares
+- **WebDAV coercion** — WebClient HTTP-to-LDAP relay (bypasses SMB signing)
+- **DHCP coercion** — DHCP server machine account relay
 
 ### Credential Harvesting
 - **Kerberoasting** — extract and auto-crack SPN hashes (hashcat mode 13100/19700)
@@ -34,8 +36,6 @@ A fully automated penetration testing tool that chains 19 attack techniques to c
 - **Shadow Credentials** — msDS-KeyCredentialLink via ntlmrelayx or pywhisker
 - **RBCD abuse** — Resource-Based Constrained Delegation (addcomputer + S4U2Proxy)
 - **GPO abuse** — pyGPOAbuse scheduled task as SYSTEM
-- **WebDAV coercion** — WebClient HTTP→LDAP relay (bypasses SMB signing)
-- **DHCP coercion** — DHCP server machine account relay
 
 ### Domain Compromise
 - **DCSync** — full domain hash dump via impacket-secretsdump
@@ -55,9 +55,9 @@ sudo ./ad-autopwn.py
 # Individual phases
 ./ad-autopwn.py --phase roast -u user -p pass -d corp.local --dc-ip 10.0.0.1
 ./ad-autopwn.py --phase adcs -u user -p pass -d corp.local --dc-ip 10.0.0.1
+./ad-autopwn.py --phase sccm -u user -p pass -d corp.local --dc-ip 10.0.0.1
 ./ad-autopwn.py --phase sniff --sniff-duration 60
 ./ad-autopwn.py --phase pxe
-./ad-autopwn.py --phase sccm -u user -p pass -d corp.local --dc-ip 10.0.0.1
 
 # AppLocker bypass
 ./ad-autopwn.py -u user -p pass --applocker --lolbin mshta --custom-cmd "whoami"
@@ -85,24 +85,64 @@ sudo ./ad-autopwn.py
 
 ## Dependencies
 
-Runs on Kali Linux with standard tools:
+### APT Packages (Kali Linux)
 
-```
+```bash
 # Core (required)
 apt install python3 impacket-scripts netexec nmap hashcat
 
-# Recommended
-apt install tcpdump responder certipy-ad bloodyad dsniff arp-scan john
+# Network attacks
+apt install tcpdump responder dsniff arp-scan
 
-# Optional
-pip install pywhisker coercer
+# AD exploitation
+apt install certipy-ad bloodyad smbclient
+
+# PXE/WIM
+apt install atftp wimtools
+
+# Hash cracking
+apt install hashcat john
+```
+
+### Git Repositories (clone to /opt/tools/)
+
+```bash
+git clone https://github.com/mverschu/CVE-2025-33073 /opt/tools/CVE-2025-33073
+git clone https://github.com/dirkjanm/krbrelayx /opt/tools/krbrelayx
+git clone https://github.com/Wh04m1001/DFSCoerce /opt/tools/DFSCoerce
+git clone https://github.com/ShutdownRepo/ShadowCoerce /opt/tools/ShadowCoerce
+git clone https://github.com/ShutdownRepo/pywhisker /opt/tools/pywhisker
+git clone https://github.com/dirkjanm/PKINITtools /opt/tools/PKINITtools
+git clone https://github.com/csandker/pxethiefy /opt/tools/pxethiefy
+git clone https://github.com/garrettfoster13/sccmhunter /opt/tools/sccmhunter
+git clone https://github.com/dirkjanm/mitm6 /opt/tools/mitm6
+git clone https://github.com/Hackndo/pyGPOAbuse /opt/tools/pyGPOAbuse
+git clone https://github.com/Hackndo/WebclientServiceScanner /opt/tools/WebclientServiceScanner
+git clone https://github.com/p0dalirius/DHCPCoerce /opt/tools/DHCPCoerce
+```
+
+### Pipx Packages
+
+```bash
+pipx install coercer
+pipx install wsuks --system-site-packages
+```
+
+### Quick Install (all deps)
+
+Use the companion [kali-install.sh](https://github.com/jonaslejon/kali-install) to install everything automatically:
+
+```bash
+sudo ./kali-install.sh
 ```
 
 ## Tested Against
 
 - **GOAD (Game of Active Directory)** — Orange Cyberdefense AD lab
 - Validated on AWS eu-west-1 with GOAD-Light (3 VMs, 2 domains)
-- Successfully: Kerberoasted 3 accounts, AS-REP roasted 1, found AD CS ESC8, DCSync 20 hashes + krbtgt
+- Kerberoasted 3 accounts (auto-cracked with rockyou.txt)
+- AS-REP roasted 1 account (auto-cracked)
+- Found AD CS ESC8, DCSync 20 hashes + krbtgt
 
 ## Disclaimer
 
@@ -116,4 +156,4 @@ Triop AB — [https://triop.se](https://triop.se)
 
 ## License
 
-For authorized security assessments only.
+MIT
