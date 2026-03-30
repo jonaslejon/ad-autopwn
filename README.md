@@ -128,12 +128,37 @@ pipx install coercer
 pipx install wsuks --system-site-packages
 ```
 
-### Quick Install (all deps)
-
-Use the companion [kali-install.sh](https://github.com/jonaslejon/kali-install) to install everything automatically:
+### Quick Install (all deps on Kali)
 
 ```bash
-sudo ./kali-install.sh
+# Install all APT packages
+sudo apt install python3 impacket-scripts netexec nmap hashcat \
+  tcpdump responder dsniff arp-scan certipy-ad bloodyad \
+  smbclient atftp wimtools john
+
+# Clone all required repos
+for repo in mverschu/CVE-2025-33073 dirkjanm/krbrelayx \
+  Wh04m1001/DFSCoerce ShutdownRepo/ShadowCoerce \
+  ShutdownRepo/pywhisker dirkjanm/PKINITtools \
+  csandker/pxethiefy garrettfoster13/sccmhunter \
+  dirkjanm/mitm6 Hackndo/pyGPOAbuse \
+  Hackndo/WebclientServiceScanner p0dalirius/DHCPCoerce; do
+  sudo git clone https://github.com/$repo /opt/tools/$(basename $repo)
+done
+
+# Install Python deps for repos
+for repo in pywhisker PKINITtools sccmhunter pxethiefy mitm6 pyGPOAbuse; do
+  [ -f /opt/tools/$repo/requirements.txt ] && \
+    pip3 install -r /opt/tools/$repo/requirements.txt
+done
+
+# Pipx packages
+pipx install coercer
+pipx install wsuks --system-site-packages
+
+# Install ad-autopwn
+sudo cp ad-autopwn.py /usr/local/bin/ad-autopwn
+sudo chmod +x /usr/local/bin/ad-autopwn
 ```
 
 ## Tested Against
