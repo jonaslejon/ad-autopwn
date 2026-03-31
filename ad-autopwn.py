@@ -1639,10 +1639,12 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         "udp port 4011"             # SCCM ProxyDHCP
     )
 
-    # Run tcpdump in text mode for parsing
+    # Run tcpdump for the full duration — timeout is the only limit
+    # (no -c flag, so it captures all packets until timeout expires)
+    log.info(f"Capturing for {duration}s on {iface}...")
     result = run(
-        ["tcpdump", "-i", iface, "-n", "-l", "-c", "200", bpf],
-        cfg, timeout=duration + 5, capture=True,
+        ["tcpdump", "-i", iface, "-n", "-l", bpf],
+        cfg, timeout=duration, capture=True,
         outfile=capture_file
     )
 
@@ -5337,6 +5339,14 @@ def main():
     if cfg.dry_run:
         log.warning("DRY RUN MODE — commands will be printed but not executed")
         print()
+
+    # Check root for phases that need it
+    if os.geteuid() != 0 and cfg.phase in ("full", "arp", "wpad", "wsus", "sniff") and not cfg.dry_run:
+        log.error("Root required for network attacks (ARP spoof, packet capture, iptables)")
+        log.error("Run with: sudo ad-autopwn " + " ".join(sys.argv[1:]))
+        sys.exit(1)
+    elif os.geteuid() != 0 and not cfg.dry_run:
+        log.warning("Not running as root — network attacks (sniff, ARP, WPAD, WSUS) will be skipped")
 
     # Setup
     if not check_prerequisites(cfg):
