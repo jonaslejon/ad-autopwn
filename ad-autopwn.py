@@ -575,12 +575,21 @@ class AutoDiscovery:
                     ["nmap", "-sn", "-Pn", "--system-dns", target_ip],
                     timeout=10, text=True, stderr=subprocess.DEVNULL
                 )
-                # Look for FQDN like "dc01.corp.local"
-                fqdn_match = re.search(r"for\s+\S+\.(\S+\.\S+)", out)
+                # Look for FQDN like "dc01.corp.local" (not IP addresses)
+                fqdn_match = re.search(r"for\s+([a-zA-Z][a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+)", out)
                 if fqdn_match:
-                    dom = fqdn_match.group(1)
-                    self._set("domain", dom, "reverse DNS")
-                    return
+                    fqdn = fqdn_match.group(1)
+                    # Extract domain from FQDN (remove hostname)
+                    parts = fqdn.split(".")
+                    if len(parts) >= 3:
+                        dom = ".".join(parts[1:])
+                    elif len(parts) == 2:
+                        dom = fqdn
+                    else:
+                        dom = ""
+                    if dom and not re.match(r"^\d+\.\d+", dom):  # Not an IP
+                        self._set("domain", dom, "reverse DNS")
+                        return
             except Exception:
                 pass
 
