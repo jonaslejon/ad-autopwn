@@ -1669,6 +1669,7 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         "nbtns": set(),
         "pxe": set(),
         "tftp": set(),
+        "domains": set(),   # Domain names seen in traffic
     }
 
     if not tool_exists("tcpdump"):
@@ -1756,6 +1757,29 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         if ".4011" in line and src_ip:
             results["pxe"].add(src_ip)
 
+        # Extract domain names from DNS queries, Kerberos, LDAP, SMB traffic
+        # DNS queries: "A? dc01.corp.local" or "SRV? _ldap._tcp.corp.local"
+        dns_match = re.findall(r"[A-Z]+\?\s+\S+?\.([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?)", line)
+        for dom in dns_match:
+            dom = dom.lower().rstrip(".")
+            # Filter out non-AD domains
+            if dom and not dom.endswith((".in-addr.arpa", ".ip6.arpa", ".cloudfront.net",
+                                         ".googleapis.com", ".amazonaws.com", ".azure.com",
+                                         ".microsoft.com", ".windows.com", ".akamai.net",
+                                         ".google.com", ".gstatic.com")):
+                results["domains"].add(dom)
+
+        # Kerberos: realm names in AS-REQ/TGS-REQ
+        krb_match = re.findall(r"realm[:\s]+([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", line, re.IGNORECASE)
+        for dom in krb_match:
+            results["domains"].add(dom.lower())
+
+        # NTLM: domain names in NTLMSSP messages
+        ntlm_match = re.findall(r"NTLMSSP.*?(?:Domain|Target)[:\s]+([a-zA-Z0-9.-]+)", line, re.IGNORECASE)
+        for dom in ntlm_match:
+            if "." in dom:
+                results["domains"].add(dom.lower())
+
     # Report findings
     separator()
     found_anything = False
@@ -1801,6 +1825,24 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         for ip in sorted(results["tftp"]):
             detail(ip)
         found_anything = True
+
+    if results["domains"]:
+        ok(f"🏢 Domain name(s) detected in traffic:")
+        for dom in sorted(results["domains"]):
+            detail(dom)
+        found_anything = True
+        # Auto-set domain if not already specified
+        if not cfg.domain:
+            # Prefer domains with common AD TLDs
+            best_domain = ""
+            for dom in sorted(results["domains"]):
+                if dom.endswith((".local", ".internal", ".corp", ".lan", ".ad")):
+                    best_domain = dom
+                    break
+            if not best_domain:
+                best_domain = sorted(results["domains"])[0]
+            cfg.domain = best_domain
+            ok(f"Auto-detected domain from traffic: {cfg.domain}")
 
     if not found_anything:
         log.warning(f"No WPAD/WSUS/PXE/LLMNR/DHCPv6 traffic detected in {duration}s")
