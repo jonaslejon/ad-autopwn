@@ -51,7 +51,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.2.1"
+VERSION = "4.3.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -5429,7 +5429,7 @@ def parse_args() -> Config:
     if args.output:
         cfg.work_dir = Path(args.output)
     else:
-        cfg.work_dir = Path(f"./ntlm-chain-{datetime.now():%Y%m%d-%H%M%S}")
+        cfg.work_dir = Path(f"./ad-autopwn-{datetime.now():%Y%m%d-%H%M%S}")
 
     return cfg
 
