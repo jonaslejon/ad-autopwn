@@ -118,7 +118,6 @@ git clone https://github.com/garrettfoster13/sccmhunter /opt/tools/sccmhunter
 git clone https://github.com/dirkjanm/mitm6 /opt/tools/mitm6
 git clone https://github.com/Hackndo/pyGPOAbuse /opt/tools/pyGPOAbuse
 git clone https://github.com/Hackndo/WebclientServiceScanner /opt/tools/WebclientServiceScanner
-git clone https://github.com/p0dalirius/DHCPCoerce /opt/tools/DHCPCoerce
 ```
 
 ### Pipx Packages
@@ -142,7 +141,6 @@ for repo in mverschu/CVE-2025-33073 dirkjanm/krbrelayx \
   ShutdownRepo/pywhisker dirkjanm/PKINITtools \
   csandker/pxethiefy garrettfoster13/sccmhunter \
   dirkjanm/mitm6 Hackndo/pyGPOAbuse \
-  Hackndo/WebclientServiceScanner p0dalirius/DHCPCoerce; do
   sudo git clone https://github.com/$repo /opt/tools/$(basename $repo)
 done
 
