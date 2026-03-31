@@ -550,20 +550,74 @@ class AutoDiscovery:
     def _detect_domain(self):
         if self._skip("domain"):
             return
-        # resolv.conf
+
+        # Method 1: resolv.conf (search/domain directives)
         resolv = Path("/etc/resolv.conf")
         if resolv.exists():
             for line in resolv.read_text().splitlines():
                 if line.startswith("search "):
                     dom = line.split()[1] if len(line.split()) > 1 else ""
-                    if dom and "." in dom:
+                    # Skip generic/cloud domains
+                    if dom and "." in dom and not dom.endswith((".internal", ".local.cloud", ".amazonaws.com", ".compute.internal")):
                         self._set("domain", dom, "resolv.conf")
                         return
                 if line.startswith("domain "):
                     dom = line.split()[1] if len(line.split()) > 1 else ""
-                    if dom:
+                    if dom and not dom.endswith((".internal", ".amazonaws.com", ".compute.internal")):
                         self._set("domain", dom, "resolv.conf")
                         return
+
+        # Method 2: Reverse DNS on the gateway or DC IP
+        target_ip = self.cfg.dc_ip or self.cfg.gateway
+        if target_ip and tool_exists("nmap"):
+            try:
+                out = subprocess.check_output(
+                    ["nmap", "-sn", "-Pn", "--system-dns", target_ip],
+                    timeout=10, text=True, stderr=subprocess.DEVNULL
+                )
+                # Look for FQDN like "dc01.corp.local"
+                fqdn_match = re.search(r"for\s+\S+\.(\S+\.\S+)", out)
+                if fqdn_match:
+                    dom = fqdn_match.group(1)
+                    self._set("domain", dom, "reverse DNS")
+                    return
+            except Exception:
+                pass
+
+        # Method 3: LDAP rootDSE query against DC (zero-auth)
+        if self.cfg.dc_ip:
+            try:
+                out = subprocess.check_output(
+                    ["ldapsearch", "-x", "-H", f"ldap://{self.cfg.dc_ip}",
+                     "-s", "base", "-b", "", "defaultNamingContext"],
+                    timeout=10, text=True, stderr=subprocess.DEVNULL
+                )
+                # Parse "defaultNamingContext: DC=corp,DC=local"
+                dn_match = re.search(r"defaultNamingContext:\s*(DC=.+)", out, re.IGNORECASE)
+                if dn_match:
+                    dom = dn_match.group(1).replace("DC=", "").replace(",", ".")
+                    self._set("domain", dom, "LDAP rootDSE")
+                    return
+            except Exception:
+                pass
+
+        # Method 4: SMB null session (nxc)
+        if self.cfg.dc_ip and tool_exists("nxc"):
+            try:
+                out = subprocess.check_output(
+                    ["nxc", "smb", self.cfg.dc_ip, "-u", "", "-p", ""],
+                    timeout=15, text=True, stderr=subprocess.DEVNULL
+                )
+                # Parse "domain:CORP.LOCAL" from nxc output
+                dom_match = re.search(r"domain:(\S+)", out, re.IGNORECASE)
+                if dom_match:
+                    dom = dom_match.group(1)
+                    if "." in dom:
+                        self._set("domain", dom, "SMB null session")
+                        return
+            except Exception:
+                pass
+
         log.error("Could not detect domain — specify with -d")
 
     def _detect_dc_ip(self):
