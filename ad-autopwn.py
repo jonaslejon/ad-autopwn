@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.7.0"
+VERSION = "4.7.1"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -1773,21 +1773,31 @@ def _userenum_kerbrute(cfg: Config, candidates: list[str]) -> list[str]:
     return valid
 
 
+_CLDAP_MAX_CANDIDATES = 500  # 5s/query × 500 ≈ 42min worst case; usually much less
+
+
 def _userenum_cldap(cfg: Config, candidates: list[str]) -> list[str]:
-    """CLDAP NetLogon ping userenum (sensepost technique). Returns valid users."""
+    """CLDAP NetLogon ping userenum (sensepost technique). Returns valid users.
+
+    Each CLDAP probe has a 5s socket timeout; large candidate lists
+    explode runtime. Cap at _CLDAP_MAX_CANDIDATES — by the time we run
+    this, kerbrute has typically already narrowed the list.
+    """
     if not tool_exists("userenum-cldap"):
         log.info("userenum-cldap not installed — skipping CLDAP userenum")
         return []
     if not (cfg.dc_ip and cfg.domain):
         log.info("No DC/domain known — skipping CLDAP userenum")
         return []
-    cand_file = cfg.work_dir / "userenum-candidates.txt"
-    if not cand_file.exists():
-        cand_file.write_text("\n".join(candidates) + "\n")
+    if len(candidates) > _CLDAP_MAX_CANDIDATES:
+        log.info(f"CLDAP: capping {len(candidates)} -> {_CLDAP_MAX_CANDIDATES} candidates")
+        candidates = candidates[:_CLDAP_MAX_CANDIDATES]
+    cand_file = cfg.work_dir / "userenum-cldap-input.txt"
+    cand_file.write_text("\n".join(candidates) + "\n")
     out_file = cfg.work_dir / "userenum-cldap.txt"
     cmd = ["userenum-cldap", cfg.dc_ip, cfg.domain, str(cand_file)]
     log.info(f"🔍 CLDAP userenum ({len(candidates)} candidates)")
-    result = run(cmd, cfg, timeout=300, outfile=out_file)
+    result = run(cmd, cfg, timeout=600, outfile=out_file)
     valid = []
     if out_file.exists():
         for line in out_file.read_text().splitlines():
@@ -1931,14 +1941,21 @@ def run_credential_discovery(cfg: Config) -> bool:
     candidates = _load_user_candidates(cfg)
     log.info(f"User candidates: {len(candidates)}")
 
-    # Step 1+2: Confirm which candidates exist via Kerberos + CLDAP
+    # Step 1+2: Confirm which candidates exist via Kerberos (fast, all
+    # candidates) then CLDAP (slow per-query — narrowed by kerbrute hits
+    # plus a tail of unverified candidates).
     valid = set()
     try:
-        valid.update(_userenum_kerbrute(cfg, candidates))
+        kerb_valid = _userenum_kerbrute(cfg, candidates)
+        valid.update(kerb_valid)
     except Exception as e:
+        kerb_valid = []
         log.warning(f"kerbrute userenum failed: {e}")
+    # Feed kerbrute hits + a slice of remaining candidates into CLDAP
+    # (CLDAP corroborates and may find DC-replied users kerbrute missed).
+    cldap_input = list(dict.fromkeys(kerb_valid + candidates))
     try:
-        valid.update(_userenum_cldap(cfg, candidates))
+        valid.update(_userenum_cldap(cfg, cldap_input))
     except Exception as e:
         log.warning(f"CLDAP userenum failed: {e}")
 
