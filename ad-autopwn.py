@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.4.0"
+VERSION = "4.4.1"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -385,8 +385,17 @@ def run(cmd: list[str], cfg: Config, timeout: int = 300,
         if not capture and result.stdout:
             print(result.stdout, end="")
         return result
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         log.warning(f"Command timed out after {timeout}s: {cmd_str}")
+        # Persist any output captured before the timeout — required for
+        # phases like passive_sniff() that intentionally run to timeout.
+        # subprocess.TimeoutExpired carries .stdout/.stderr (bytes or str
+        # depending on text= flag); coerce to str for write_text.
+        if outfile:
+            def _to_str(x):
+                if x is None: return ""
+                return x.decode(errors="replace") if isinstance(x, bytes) else x
+            outfile.write_text(_to_str(e.stdout) + _to_str(e.stderr))
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="timeout")
     except FileNotFoundError:
         log.error(f"Command not found: {cmd[0]}")
