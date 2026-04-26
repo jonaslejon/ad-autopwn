@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.7.2"
+VERSION = "4.7.3"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -2009,21 +2009,20 @@ def run_credential_discovery(cfg: Config) -> bool:
             log.warning(f"CLDAP userenum failed: {e}")
         return valid
 
-    # Tier 1: curated AD-biased list (~100, fast). Most enterprise environments
-    # hit something here.
-    candidates = _load_user_candidates(cfg, tier="ad")
-    log.info(f"Tier 1 (AD-biased curated): {len(candidates)} candidates")
+    # Userenum via KRB-ERROR / CLDAP NetLogon is read-only at the protocol
+    # level — no auth attempts, no lockout-counter ticks. So merge the
+    # curated AD-biased list with SecLists in one pass. Curated entries
+    # come first so they win the CLDAP cap (still 500 in _userenum_cldap).
+    if cfg.users_file:
+        # Operator explicitly chose a list — honor it as-is.
+        candidates = _load_user_candidates(cfg, tier="ad")  # honors users_file inside
+    else:
+        ad = _load_user_candidates(cfg, tier="ad")
+        seclists = _load_user_candidates(cfg, tier="seclists")
+        # dedupe-preserving merge: curated first, then SecLists tail
+        candidates = list(dict.fromkeys(ad + seclists))
+    log.info(f"Candidates (curated ∪ SecLists, deduped): {len(candidates)}")
     valid = _userenum_pass(candidates)
-
-    # Tier 2 fallback: SecLists if Tier 1 found nothing AND no --users-file
-    # was given (operator override implies they want exactly that list).
-    if not valid and not cfg.users_file:
-        log.info("Tier 1 found nothing — falling back to SecLists")
-        seclist_candidates = _load_user_candidates(cfg, tier="seclists")
-        if seclist_candidates and seclist_candidates != candidates:
-            log.info(f"Tier 2 (SecLists): {len(seclist_candidates)} candidates")
-            valid = _userenum_pass(seclist_candidates)
-            candidates = seclist_candidates  # for downstream phases
 
     if valid:
         cfg.discovered_users = sorted(valid)
