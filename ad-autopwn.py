@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.4.1"
+VERSION = "4.5.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -1707,6 +1707,7 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         "pxe": set(),
         "tftp": set(),
         "domains": set(),   # Domain names seen in traffic
+        "dcs": {},          # ip -> set of AD services seen on that IP's well-known ports
     }
 
     if not tool_exists("tcpdump"):
@@ -1716,7 +1717,8 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
     iface = cfg.iface or "eth0"
     capture_file = cfg.work_dir / "passive-capture.txt"
 
-    # Capture filter: LLMNR, mDNS, DHCPv6, WSUS, DNS, NBT-NS, PXE/DHCP, TFTP, SCCM
+    # Capture filter: LLMNR, mDNS, DHCPv6, WSUS, DNS, NBT-NS, PXE/DHCP, TFTP,
+    # SCCM, plus AD-DC fingerprinting ports (Kerberos/LDAP/LDAPS/SMB).
     bpf = (
         "udp port 5355 or "         # LLMNR
         "udp port 5353 or "         # mDNS
@@ -1728,7 +1730,12 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         "udp port 67 or "           # DHCP server (PXE boot requests)
         "udp port 68 or "           # DHCP client
         "udp port 69 or "           # TFTP (PXE image transfers)
-        "udp port 4011"             # SCCM ProxyDHCP
+        "udp port 4011 or "         # SCCM ProxyDHCP
+        "tcp port 88 or "           # Kerberos (DC)
+        "udp port 88 or "           # Kerberos UDP (DC)
+        "tcp port 389 or "          # LDAP (DC)
+        "tcp port 636 or "          # LDAPS (DC)
+        "tcp port 445"              # SMB (DC and member servers)
     )
 
     # Run tcpdump for the full duration — timeout is the only limit
@@ -1793,6 +1800,45 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         # SCCM ProxyDHCP (port 4011)
         if ".4011" in line and src_ip:
             results["pxe"].add(src_ip)
+
+        # AD DC fingerprinting: any host seen on a well-known AD service port
+        # is a candidate Domain Controller (or member server for SMB).
+        # Greedy [\w.:]+ swallows v4 and v6 addresses; backtracks to the
+        # rightmost ".<digits>" boundary.
+        ad_ports = {
+            "88":  "Kerberos",
+            "389": "LDAP",
+            "636": "LDAPS",
+            "445": "SMB",
+        }
+        endpoint = re.match(
+            r"\d{2}:\d{2}:\d{2}\.\d+\s+IP6?\s+([\w.:]+)\.(\d+)\s+>\s+([\w.:]+)\.(\d+)",
+            line,
+        )
+        if endpoint:
+            s_ip, s_port, d_ip, d_port = endpoint.groups()
+            if s_port in ad_ports:
+                results["dcs"].setdefault(s_ip, set()).add(ad_ports[s_port])
+            if d_port in ad_ports:
+                results["dcs"].setdefault(d_ip, set()).add(ad_ports[d_port])
+
+        # AD-aware DNS SRV: `_ldap._tcp.dc._msdcs.<domain>` queries are the
+        # canonical "find me a DC" signal. The destination of the query is
+        # an AD-integrated DNS server (frequently the DC itself).
+        msdcs_match = re.search(
+            r"SRV\?\s+(?:_\w+\._\w+\.)?dc\._msdcs\.([\w.-]+)",
+            line, re.IGNORECASE
+        )
+        if msdcs_match:
+            dom = msdcs_match.group(1).lower().rstrip(".")
+            if dom:
+                results["domains"].add(dom)
+            # The destination of the DNS query is the candidate AD DNS/DC
+            dns_dst = re.search(
+                r"\s+>\s+([\w.:]+)\.53\b", line
+            )
+            if dns_dst:
+                results["dcs"].setdefault(dns_dst.group(1), set()).add("AD-DNS")
 
         # Extract domain names from DNS queries, Kerberos, LDAP, SMB traffic
         # DNS queries: "A? dc01.corp.local" or "SRV? _ldap._tcp.corp.local"
@@ -1863,6 +1909,26 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
             detail(ip)
         found_anything = True
 
+    if results["dcs"]:
+        # Sort DC candidates by service-count descending so the strongest
+        # candidate is reported first. AD-DNS-only is the weakest signal.
+        ranked = sorted(
+            results["dcs"].items(),
+            key=lambda kv: (-len(kv[1]), kv[0]),
+        )
+        ok(f"🏛️  AD DC candidate(s) detected: {len(ranked)}")
+        for ip, svcs in ranked:
+            detail(f"{ip}  ({', '.join(sorted(svcs))})")
+        # Auto-fill cfg.dc_ip if a strong candidate exists and not user-set.
+        # Strong = has at least Kerberos or LDAP (i.e., not just AD-DNS).
+        if not cfg.dc_ip:
+            for ip, svcs in ranked:
+                if {"Kerberos", "LDAP", "LDAPS"} & svcs:
+                    cfg.dc_ip = ip
+                    ok(f"Auto-detected DC IP from passive sniff: {cfg.dc_ip}")
+                    break
+        found_anything = True
+
     if results["domains"]:
         ok(f"🏢 Domain name(s) detected in traffic:")
         for dom in sorted(results["domains"]):
@@ -1889,15 +1955,24 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
     discovery_file = cfg.work_dir / "passive-discovery.txt"
     lines = []
     for key, ips in results.items():
-        if ips:
-            lines.append(f"[{key}]")
+        if not ips:
+            continue
+        lines.append(f"[{key}]")
+        if key == "dcs":
+            # dict of ip -> set(services)
+            for ip, svcs in sorted(ips.items()):
+                lines.append(f"  {ip}  ({', '.join(sorted(svcs))})")
+        else:
             for ip in sorted(ips):
                 lines.append(f"  {ip}")
     if lines:
         discovery_file.write_text("\n".join(lines) + "\n")
         detail(f"Results saved to {discovery_file}")
 
-    return {k: list(v) for k, v in results.items()}
+    out = {}
+    for k, v in results.items():
+        out[k] = {ip: sorted(s) for ip, s in v.items()} if k == "dcs" else list(v)
+    return out
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
