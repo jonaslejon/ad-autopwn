@@ -52,7 +52,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.7.3"
+VERSION = "4.7.4"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 
@@ -1800,7 +1800,11 @@ def _load_user_candidates(cfg: Config, *, tier: str = "ad") -> list[str]:
 
 
 def _userenum_kerbrute(cfg: Config, candidates: list[str]) -> list[str]:
-    """Kerberos-based user enumeration via kerbrute. Returns valid usernames."""
+    """Kerberos-based user enumeration via kerbrute. Returns valid usernames.
+
+    Output streams directly to terminal (kerbrute has its own progress
+    reporting); valid hits are also written via -o for parsing afterwards.
+    """
     if not tool_exists("kerbrute"):
         log.info("kerbrute not installed — skipping Kerberos userenum")
         return []
@@ -1812,12 +1816,20 @@ def _userenum_kerbrute(cfg: Config, candidates: list[str]) -> list[str]:
     out_file = cfg.work_dir / "userenum-kerbrute.txt"
     cmd = ["kerbrute", "userenum", "-d", cfg.domain, "--dc", cfg.dc_ip,
            "-o", str(out_file), str(cand_file)]
-    log.info(f"🔍 kerbrute userenum ({len(candidates)} candidates)")
-    result = run(cmd, cfg, timeout=300)
+    log.info(f"🔍 kerbrute userenum ({len(candidates)} candidates) — streaming")
+    if cfg.dry_run:
+        print(f"  [DRY RUN] {' '.join(cmd)}")
+    else:
+        try:
+            # No capture: kerbrute streams progress directly to operator.
+            subprocess.run(cmd, timeout=600, check=False)
+        except subprocess.TimeoutExpired:
+            log.warning("kerbrute userenum timed out (10min cap)")
+        except Exception as e:
+            log.warning(f"kerbrute userenum error: {e}")
     valid = []
     if out_file.exists():
         for line in out_file.read_text().splitlines():
-            # kerbrute prints "[+] VALID USERNAME: user@DOMAIN"
             m = re.search(r"VALID USERNAME:\s+(\S+?)@", line)
             if m:
                 valid.append(m.group(1))
@@ -1850,9 +1862,19 @@ def _userenum_cldap(cfg: Config, candidates: list[str]) -> list[str]:
     cand_file = cfg.work_dir / "userenum-cldap-input.txt"
     cand_file.write_text("\n".join(candidates) + "\n")
     out_file = cfg.work_dir / "userenum-cldap.txt"
-    cmd = ["userenum-cldap", cfg.dc_ip, cfg.domain, str(cand_file)]
-    log.info(f"🔍 CLDAP userenum ({len(candidates)} candidates)")
-    result = run(cmd, cfg, timeout=600, outfile=out_file)
+    # Pipe through tee so output streams to operator AND is captured.
+    cmd = ["bash", "-c",
+           f"userenum-cldap {cfg.dc_ip} {cfg.domain} {cand_file} 2>&1 | tee {out_file}"]
+    log.info(f"🔍 CLDAP userenum ({len(candidates)} candidates) — streaming")
+    if cfg.dry_run:
+        print(f"  [DRY RUN] userenum-cldap {cfg.dc_ip} {cfg.domain} {cand_file}")
+    else:
+        try:
+            subprocess.run(cmd, timeout=900, check=False)
+        except subprocess.TimeoutExpired:
+            log.warning("CLDAP userenum timed out (15min cap)")
+        except Exception as e:
+            log.warning(f"CLDAP userenum error: {e}")
     valid = []
     if out_file.exists():
         for line in out_file.read_text().splitlines():
