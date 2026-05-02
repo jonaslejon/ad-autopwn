@@ -58,7 +58,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.10.0"
+VERSION = "4.10.1"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 KRBRELAYX_DIR = TOOLS_DIR / "krbrelayx"
@@ -914,6 +914,81 @@ class AutoDiscovery:
 # Prerequisites
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _check_impacket_ntlmrelayx_consistency() -> bool:
+    """Detect the impacket wrapper/library version mismatch where the
+    stale CLI wrapper (e.g. /home/goad/.local/bin/ntlmrelayx.py from an
+    old `pip install --user impacket`) calls
+    `NTLMRelayxConfig.setRPCOptions(...)` with fewer args than the
+    currently installed library expects, causing a TypeError on every
+    invocation. Common after a system-wide `pip install --upgrade
+    impacket` over an older user-site wrapper. Pure-introspection so
+    it runs in milliseconds without spawning the binary.
+
+    Returns True if no mismatch detected (or check skipped).
+    Returns False (and logs a loud warning) if mismatch found."""
+    if not tool_exists("impacket-ntlmrelayx"):
+        return True
+
+    script_path = shutil.which("impacket-ntlmrelayx")
+    if not script_path:
+        return True
+    try:
+        # Resolve symlink — the actual Python wrapper file we want to read
+        actual_path = Path(script_path).resolve()
+        content = actual_path.read_text(errors="replace")
+    except Exception:
+        return True  # can't read wrapper, skip check silently
+
+    # Find how many positional args the wrapper passes
+    m = re.search(r"\.setRPCOptions\s*\(([^)]*)\)", content)
+    if not m:
+        return True  # wrapper doesn't call setRPCOptions, no risk
+
+    args_passed = [a.strip() for a in m.group(1).split(",") if a.strip()]
+    n_passed = len(args_passed)
+
+    # Find how many the installed library requires (Python introspection).
+    # Class moved between minor versions; try the known module paths.
+    cls = None
+    for module_path in (
+        "impacket.examples.ntlmrelayx.servers.config",
+        "impacket.examples.ntlmrelayx.config",
+        "impacket.examples.ntlmrelayx.utils.config",
+    ):
+        try:
+            mod = __import__(module_path, fromlist=["NTLMRelayxConfig"])
+            cls = getattr(mod, "NTLMRelayxConfig", None)
+            if cls and hasattr(cls, "setRPCOptions"):
+                break
+        except (ImportError, AttributeError):
+            continue
+    if cls is None or not hasattr(cls, "setRPCOptions"):
+        return True  # library not importable / class moved, skip silently
+
+    try:
+        import inspect
+        sig = inspect.signature(cls.setRPCOptions)
+        n_required = sum(
+            1 for p in sig.parameters.values()
+            if p.default is p.empty and p.name != "self"
+        )
+    except Exception:
+        return True
+
+    if n_passed < n_required:
+        log.error(f"impacket version mismatch: {actual_path} calls "
+                  f"setRPCOptions({n_passed} args), but the installed "
+                  f"library requires {n_required}. Every ntlmrelayx "
+                  f"invocation will crash with TypeError.")
+        log.error("Affected phases: arp, wpad, wsus, exploit. Fix:")
+        detail(f"  $ sudo rm {actual_path}")
+        detail(f"  $ sudo apt --reinstall install impacket-scripts")
+        detail(f"  (apt-managed wrappers stay in sync with python3-impacket; "
+               f"pip-installed wrappers do not.)")
+        return False
+    return True
+
+
 def check_prerequisites(cfg: Config) -> bool:
     log.info("🔧 Checking prerequisites...")
     missing = False
@@ -1047,6 +1122,15 @@ def check_prerequisites(cfg: Config) -> bool:
     # DPAPI
     if tool_exists("impacket-dpapi"):
         ok("impacket-dpapi available (DPAPI backup key extraction)")
+
+    # ── impacket-ntlmrelayx wrapper/library version-mismatch trap ──────
+    # When pip-install impacket leaves a stale wrapper script in
+    # ~/.local/bin/ and the library is later upgraded, the wrapper calls
+    # setRPCOptions() with fewer args than the new library expects → every
+    # ntlmrelayx invocation dies with TypeError before it can do anything.
+    # This breaks every L2/relay phase (arp, wpad, wsus, exploit). Detect
+    # by introspection — fast (<10 ms) and reliable.
+    _check_impacket_ntlmrelayx_consistency()
 
     # ── v4.9.0 additions ────────────────────────────────────────────────
     # Discover phase
