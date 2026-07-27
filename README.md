@@ -63,6 +63,12 @@ authorized security assessments.
   - ESC8 (web-enrollment relay)
   - ESC9/ESC10 UPN-swap (CVE-2022-26923 bypass)
   - ESC4 template modify+exploit+restore (cwd-safe)
+  - **ESC1-CMC** — KB5014754 bypass via CMC `id-cmc-addExtensions` (bundled
+    `cmc_addext.py`). When a patched CA issues an ESC1 cert but PKINIT binds to
+    the requester, ad-autopwn falls back to forging an Administrator cert with a
+    **matching `szOID_NTDS_CA_SECURITY_EXT` SID** — so PKINIT wins even at
+    `StrongCertificateBindingEnforcement=2`. The only path here that beats full
+    enforcement, and (unlike ESC9/ESC10) needs no controllable victim account.
   - Certihound enumeration with certipy fallback (NT-hash auth)
 - **Shadow Credentials** — msDS-KeyCredentialLink via ntlmrelayx or pywhisker
 - **RBCD abuse** — Resource-Based Constrained Delegation (addcomputer + S4U2Self + S4U2Proxy)
@@ -130,7 +136,7 @@ sudo ./ad-autopwn.py --phase discover --no-arp --no-wpad
 | `enrich`          | yes    | nxc 13-module battery (LAPS, timeroast, MAQ, nopac, zerologon, …) + auto-consumer |
 | `bloodhound`      | yes    | `bloodhound-python -c All` + analysis + auto-action chains |
 | `roast`           | yes    | Kerberoast + AS-REP Roast |
-| `adcs`            | yes    | AD CS exploitation (ESC1-ESC16) |
+| `adcs`            | yes    | AD CS exploitation (ESC1-ESC16 + ESC1-CMC KB5014754 bypass) |
 | `sccm`            | yes    | SCCM NAA credential theft |
 | `exploit`         | yes    | NTLM reflection / coercion exploit on a specific target |
 | `dcsync`          | yes (DA) | Domain hash dump |
@@ -143,6 +149,17 @@ sudo ./ad-autopwn.py --phase discover --no-arp --no-wpad
 | `kerb-reflect`    | yes    | CVE-2025-58726 ghost-SPN AP-REQ reflection |
 
 ## Dependencies
+
+### Python (this repo)
+
+`ad-autopwn.py` itself is pure standard library. The bundled companion tools
+(`cmc_addext.py`, `userenum-cldap.py`) need a few packages — install them with:
+
+```bash
+pip install -r requirements.txt   # add --break-system-packages on Kali
+```
+
+On Kali most of these already ship via `impacket-scripts` / `certipy-ad`.
 
 ### APT (Kali Linux)
 
@@ -183,6 +200,10 @@ pipx install wsuks --system-site-packages
 - `userenum-cldap` — companion CLDAP NetLogon-ping enumerator (lives in
   this repo as `userenum-cldap.py`; install to `/usr/local/bin/userenum-cldap`)
 - `asn1tools` — `pip install asn1tools` (CLDAP enum runtime dep)
+- `cmc_addext.py` — **ESC1-CMC** engine, ships in this repo. Auto-discovered
+  when it sits next to `ad-autopwn.py`, or at `/opt/tools/cmc-addext/`. Third-party
+  tool by Mohamed Alzhrani (@0xmaz) — see [Author](#author). Needs
+  `impacket`, `cryptography`, `ldap3`, `requests` (see `requirements.txt`).
 
 ### Quick install (all deps on Kali)
 
@@ -271,6 +292,20 @@ illegal. Always obtain written permission before testing.
 
 Triop AB — [https://triop.se](https://triop.se)
 
+### Bundled third-party tool
+
+`cmc_addext.py` is authored by **Mohamed Alzhrani (@0xmaz)** and vendored,
+unmodified, from [github.com/MazX0p/cmc-addext](https://github.com/MazX0p/cmc-addext).
+It implements the KB5014754 `id-cmc-addExtensions` bypass described at
+<https://0xmaz.me/posts/certsrv-id-cmc-addExtensions-KB5014754-bypass/>.
+All credit for that technique and code goes to the original author.
+
 ## License
 
-MIT
+MIT — applies to ad-autopwn's own code (`ad-autopwn.py`, `userenum-cldap.py`).
+
+`cmc_addext.py` is redistributed as-is from its upstream repository, which
+publishes no explicit license. Its copyright remains with Mohamed Alzhrani
+(@0xmaz); it is included here for convenience under the same "authorized
+testing only" terms stated in its file header. If the upstream author requests
+removal or sets different terms, we will comply — open an issue.

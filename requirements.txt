@@ -1,0 +1,17 @@
+# ad-autopwn.py itself imports only the Python standard library.
+#
+# These dependencies are for the companion tools that ship in this repo:
+#   cmc_addext.py     — ESC1-CMC (KB5014754 id-cmc-addExtensions) cert forge
+#                       needs: impacket, cryptography, ldap3, requests, urllib3
+#   userenum-cldap.py — CLDAP NetLogon-ping user enumeration
+#                       needs: asn1tools
+#
+# On Kali Linux most of these already arrive via impacket-scripts / certipy-ad.
+# Install with:  pip install -r requirements.txt  (add --break-system-packages on Kali)
+
+impacket>=0.11.0
+cryptography>=41.0.0
+ldap3>=2.9.1
+requests>=2.28.0
+urllib3>=1.26.0
+asn1tools>=0.166.0
