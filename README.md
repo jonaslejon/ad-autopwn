@@ -245,6 +245,14 @@ pipx install wsuks --system-site-packages
 - `userenum-cldap` — companion CLDAP NetLogon-ping enumerator (lives in
   this repo as `userenum-cldap.py`; install to `/usr/local/bin/userenum-cldap`)
 - `asn1tools` — `pip install asn1tools` (CLDAP enum runtime dep)
+- `ntlmv1-multi` — optional, for `--phase ntlmv1`: converts a captured
+  NetNTLMv1 hash to the crack.sh `NTHASH:` / hashcat-14000 format. Clone
+  <https://github.com/evilmog/ntlmv1-multi> to `/opt/tools/ntlmv1-multi`.
+  Without it, ad-autopwn still saves the raw hash + crack.sh instructions.
+- `Responder` needs `aioquic` (`pip install aioquic`) and generated TLS certs
+  (`certs/gen-self-signed-cert.sh`) to actually capture — required for WPAD/LLMNR
+  and the `ntlmv1` downgrade. Kali's apt `responder` handles both; a git-cloned
+  Responder does not.
 - `cmc_addext.py` — **ESC1-CMC** engine, ships in this repo. Auto-discovered
   when it sits next to `ad-autopwn.py`, or at `/opt/tools/cmc-addext/`. Third-party
   tool by Mohamed Alzhrani (@0xmaz) — see [Author](#author). Needs
@@ -303,7 +311,7 @@ install hints for anything missing.
 ## Tested against
 
 - **GOAD-Light** (Game of Active Directory, Orange Cyberdefense)
-  on AWS `eu-west-1` — full v4.10.0 phase coverage verified
+  on AWS `eu-west-1` — v4.12.0 phase coverage verified
   end-to-end. Auto-discovery on AWS now works with literally just
   `--no-arp --no-wpad` (everything else — interface, attacker IP,
   domain, DC IP, DC FQDN — is auto-detected via subnet sweep + dig
@@ -312,6 +320,13 @@ install hints for anything missing.
   `stannis.baratheon → GenericAll → KINGSLANDING$` edge: from a single
   low-priv credential to admin TGS on the DC in 5 seconds.
 - DCSync extracted 20 credentials including `krbtgt` — golden ticket viable.
+- **v4.12.0 loot** proven end-to-end: local SAM/LSA dump on `castelblack`
+  → pass-the-hash reuse sweep pivoted with the RID-500 hash (`goadmin`) →
+  `Pwn3d!`. The PtH sweep keys on **RID 500**, not the account name, since
+  the built-in admin is commonly renamed.
+- **v4.12.0 NetNTLMv1** coercion + static-challenge downgrade validated at
+  the packet level against `winterfell` (nxc `coerce_plus`); the DC returns
+  a NetNTLMv1 response to the `1122334455667788` challenge as expected.
 
 ## Safety
 
