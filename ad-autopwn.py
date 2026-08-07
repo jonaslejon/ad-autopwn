@@ -30,6 +30,9 @@
 ║      - Unicode-SPN Kerberos reflection (CVE-2025-58726 ghost SPN)║
 ║      - CVE-2026-24294 LPE (SMB-on-arbitrary-tcpport)             ║
 ║      - CVE-2026-26128 LPE (Kerberos loopback via Unicode SPN)    ║
+║  22. gMSA managed-password read → machine NT hash               ║
+║  23. NetNTLMv1 downgrade → machine NT hash (crack.sh/hashcat)   ║
+║  24. Local SAM/LSA/LSASS loot + Pass-the-Hash reuse sweep        ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
