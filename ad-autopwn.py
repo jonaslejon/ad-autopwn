@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  NTLM Relay Attack Chain Automation                              ║
+║  Active Directory Attack Chain Automation                        ║
 ║  Triop AB — For authorized penetration testing only              ║
 ║                                                                  ║
 ║  Automated zero-auth to domain compromise:                       ║
@@ -9192,7 +9192,7 @@ def print_summary(cfg: Config):
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser(
-        description="NTLM Relay Attack Chain: zero-auth to domain compromise — Triop AB",
+        description="Active Directory Attack Chain: zero-auth to domain compromise — Triop AB",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
         Examples:
