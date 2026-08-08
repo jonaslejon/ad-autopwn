@@ -328,6 +328,37 @@ install hints for anything missing.
   the packet level against `winterfell` (nxc `coerce_plus`); the DC returns
   a NetNTLMv1 response to the `1122334455667788` challenge as expected.
 
+## Needs more testing
+
+GOAD runs in an AWS VPC, where **Layer 2 is blocked** — ARP, LLMNR/NBT-NS,
+IPv6 RA / DHCPv6 multicast and broadcast frames never reach the attacker box
+(this is why the AWS quick-start passes `--no-arp --no-wpad`). Everything in
+this list has been exercised only via `--dry-run` command emission and/or
+packet-level inspection. None has been run as a full **live capture → relay →
+crack** round-trip, and all need validation in an on-prem or nested-virt lab
+with real L2 access (or a hardware/VLAN test rig):
+
+- **Passive L2 sniffing** (`sniff`) — WPAD/WSUS/PXE/LLMNR/DHCPv6/TFTP/SCCM
+  ProxyDHCP detection all depend on actually seeing broadcast/multicast traffic.
+- **ARP spoof + NTLM relay** (`arp`) — the full spoof → capture → relay path.
+- **WPAD / LLMNR / NBT-NS poisoning** (`wpad`, mitm6 / Responder IPv6 DNS
+  hijack) — poisoned name resolution → NTLM auth capture.
+- **WSUS relay** (`wsus`) — needs a real WSUS server and a client performing
+  Windows Update NTLM auth over 8530/8531.
+- **PXE boot credential theft** (`pxe`) — needs a real PXE/OSD distribution point.
+- **SCCM NAA credential theft** (`sccm`) — needs a real SCCM site + management point.
+- **WebDAV coercion → LDAP relay** — WebClient-triggered HTTP → LDAP relay
+  (the SMB-signing bypass path).
+- **DHCP coercion** — DHCP-server machine-account relay.
+- **NetNTLMv1 full round-trip** (`ntlmv1`) — coercion + static-challenge
+  downgrade is validated at the packet level, but the live Responder capture →
+  crack.sh recovery → DCSync / self-takeover chain has **not** been run
+  end-to-end. Only the `--ntlmv1-nthash` fast-path (feeding an already-recovered
+  hash, skipping capture) is proven.
+
+Contributions of capture/PCAP evidence or lab writeups for any of the above are
+welcome — open an issue or PR.
+
 ## Safety
 
 - `--dry-run` prints every command (foreground **and** background) without
