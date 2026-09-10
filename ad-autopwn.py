@@ -3341,6 +3341,41 @@ def _test_weak_credentials(cfg: Config, users: list[str]) -> bool:
     return hit
 
 
+def _anonymous_ldap_bind(cfg: Config) -> bool:
+    """Zero-auth check: does the DC permit an anonymous (null) LDAP bind? An
+    anonymous bind is not an authenticated login, so it ticks no lockout
+    counter — safe to run unconditionally. Reports the finding and dumps the
+    Root DSE namingContexts when anonymously readable. Returns True on success."""
+    if not cfg.dc_ip:
+        return False
+    found = False
+
+    # 1) netexec null bind: a "[+]" line means the anonymous bind succeeded.
+    if tool_exists("nxc"):
+        out_file = cfg.work_dir / "anon-ldap.txt"
+        result = run(["nxc", "ldap", cfg.dc_ip, "-u", "", "-p", ""],
+                     cfg, timeout=120, outfile=out_file)
+        text = out_file.read_text(errors="replace") if out_file.exists() else (result.stdout or "")
+        if any("[+]" in ln for ln in text.splitlines()):
+            ok("Anonymous LDAP bind ALLOWED on the DC")
+            found = True
+
+    # 2) Root DSE namingContexts via anonymous ldapsearch (best-effort).
+    if tool_exists("ldapsearch"):
+        out_file = cfg.work_dir / "anon-ldap-namingcontexts.txt"
+        run(["ldapsearch", "-x", "-H", f"ldap://{cfg.dc_ip}", "-s", "base",
+             "-b", "", "namingContexts", "defaultNamingContext"],
+            cfg, timeout=60, outfile=out_file)
+        if out_file.exists() and "namingContexts:" in out_file.read_text(errors="replace"):
+            ok("Anonymous Root DSE read OK — namingContexts dumped")
+            detail(f"→ {out_file}")
+            found = True
+
+    if not found:
+        detail("Anonymous LDAP bind not permitted (or DC unreachable)")
+    return found
+
+
 def run_credential_discovery(cfg: Config) -> bool:
     """Pre-cut credential discovery: 6 zero-auth foothold techniques.
 
@@ -3362,6 +3397,12 @@ def run_credential_discovery(cfg: Config) -> bool:
         return False
 
     phase_header("PRE-CUT CREDENTIAL DISCOVERY (zero-auth foothold)")
+
+    # Anonymous LDAP bind — zero-auth finding, read-only, no lockout ticks.
+    try:
+        _anonymous_ldap_bind(cfg)
+    except Exception as e:
+        log.warning(f"Anonymous LDAP bind check failed: {e}")
 
     def _userenum_pass(candidates: list[str]) -> set[str]:
         """Run kerbrute then CLDAP over a candidate list, return valid users."""
