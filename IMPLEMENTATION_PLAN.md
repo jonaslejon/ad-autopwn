@@ -137,41 +137,30 @@ Config: `no_rodc: bool`. Dispatch: creds required. Reuse ccache handling pattern
 
 ---
 
-## Milestone 4 — Initial-access cheap wins  (P2, small, high frequency)
+## Milestone 4 — Initial-access cheap wins  — ✅ DONE (PRs #6/#7/#8)
 
-Fold into the existing `discover` (`run_credential_discovery`, `:3204`) and `enrich` batteries —
-no new phase needed.
+Shipped, folded into `discover` (`run_credential_discovery`) and the `enrich` battery — no new phase.
 
-- **Blank Password** & **Username-as-Password** — extend `_password_spray` (`:3170`):
-  `nxc smb <dc> -u users.txt -p '' --no-bruteforce` (blank) and `nxc smb … --no-bruteforce`
-  with `-u/-p` paired to the same list (user==pass). Lockout-safe: single attempt each, reuse
-  the existing spray guardrails. Covers 2 techniques for ~20 lines.
-- **Anonymous LDAP Bind** — add to `enum`/discovery: `nxc ldap <dc> -u '' -p '' --query …`
-  or `ldapsearch -x -H ldap://<dc>`. Emit a finding + dump naming context. `T1087.002`.
-- **GPP cpassword** — add `("gpp_password", "smb", subnet, "gpp_password", [])` to the nxc
-  battery `runs` list (recipe B). We currently run only `gpp_autologin`. Add a
-  `consume_nxc_findings` branch to extract decrypted creds. `T1552.006`.
-
-**Effort:** S. Ship as one "pre-auth findings" PR.
+- **Blank Password** & **Username-as-Password** — `_test_weak_credentials` (nxc `-p ''`, and the
+  user list as password file with `--no-bruteforce`). On by default; `--no-weak-pw` to skip.
+- **Anonymous LDAP Bind** — `_anonymous_ldap_bind` (nxc null bind + anonymous `ldapsearch` Root DSE).
+- **GPP cpassword** — `gpp_password` module added to the nxc battery `runs` list + a
+  `consume_nxc_findings` parser → `enrich-gpp.txt`.
 
 ---
 
-## Milestone 5 — Enumeration/surface findings  (P2)
+## Milestone 5 — Enumeration/surface findings  — ✅ DONE (PR #9)
 
-Reporting-only surfacing of access we can already reach, via `nxc`. Add to `enumerate_targets`
-(`:1566`) or as small helpers appended to `consume_nxc_findings`.
+Shipped as `enumerate_access_surface`, called from `enumerate_targets` (so `--phase enum` and
+full-auto both run it). Read-only; findings → `access-*.txt`.
 
-| Finding | Command | MITRE |
-|---|---|---|
-| Guest Session | `nxc smb <subnet> -u Guest -p ''` | T1135 |
-| RDP Access | `nxc rdp <subnet> <auth>` | T1021.001 |
-| WinRM / PS-Remoting | `nxc winrm <subnet> <auth>` (flag as finding, not just an evil-winrm hint) | T1021.006 |
-| Readable/Writable/Full-Control Share | `nxc smb <subnet> <auth> --shares` → classify ACLs | T1039/T1570 |
-| DCOM Execution | `nxc smb … -M dcomexec` (verify module) | T1021.003 |
-
-Write results to `cfg.work_dir` and add lines to the run summary (`print_summary`, `:8945`).
-We already find writable shares in `_find_writable_shares` (`:4978`) for theft-file drops —
-**reuse it** and just report the inventory. **Effort:** S–M.
+| Finding | Command | MITRE | Status |
+|---|---|---|---|
+| Guest Session | `nxc smb <subnet> -u Guest -p ''` | T1135 | ✅ |
+| RDP Access | `nxc rdp <subnet> <auth>` | T1021.001 | ✅ |
+| WinRM / PS-Remoting | `nxc winrm <subnet> <auth>` (a real finding, not just an evil-winrm hint) | T1021.006 | ✅ |
+| Readable/Writable/Full-Control Share | `nxc smb <subnet> <auth> --shares` → `_enum_share_acls` classifies ACLs | T1039/T1570 | ✅ |
+| DCOM Execution | — | T1021.003 | omitted — reduces to local-admin, already surfaced by AdminTo |
 
 ---
 
@@ -227,11 +216,11 @@ We already find writable shares in `_find_writable_shares` (`:4978`) for theft-f
 
 | Order | Milestone | Effort | Why here |
 |---|---|---|---|
-| ✅ | **M2 — Weaponize ACL edges** | S | **Done in v4.13.0** — turned existing detections into executions. |
+| ✅ | **M2 — Weaponize ACL edges** | S | Done in v4.13.0 (PR #5). |
+| ✅ | **M4 — Initial-access wins** | S | Done (PRs #6/#7/#8). |
+| ✅ | **M5 — Surface findings** | S–M | Done (PR #9). |
 | ❌ | **M1 — MSSQL suite** | — | Descoped (owner decision). |
-| 1 | **M4 — Initial-access wins** | S | Tiny, extends `discover`/battery, immediately testable. |
-| 2 | **M5 — Surface findings** | S–M | Reuses `nxc` + existing share enum. |
-| 3 | **M3 — RODC suite** | M | Self-contained; needs full-GOAD to validate. |
-| 4 | **M6 — Trust / groups / CVEs / ESC17** | S–M | Mostly detections; finish the long tail. |
+| 1 | **M3 — RODC suite** | M | Self-contained; needs full-GOAD to validate. |
+| 2 | **M6 — Trust / groups / CVEs / ESC17** | S–M | Mostly detections; finish the long tail. |
 
-M2 (ACL weaponization) is shipped; next up is M4 (initial-access cheap wins).
+M2/M4/M5 are shipped and merged. Remaining: **M3 (RODC)** and **M6 (long tail)**.
