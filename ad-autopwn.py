@@ -1563,6 +1563,94 @@ def run_arp_capture(cfg: Config, priority_hosts: list[str] | None = None) -> boo
 # Phase 1: Enumeration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _nxc_hosts_on_hit(text: str, *, need_pwn: bool = False) -> list[str]:
+    """Extract 'HOST (ip)' from netexec '[+]' success lines. nxc format:
+    'PROTO <ip> <port> <HOST> [+] dom\\user:... (Pwn3d!)'."""
+    hosts: list[str] = []
+    for ln in text.splitlines():
+        if "[+]" not in ln:
+            continue
+        if need_pwn and "Pwn3d" not in ln:
+            continue
+        m = re.match(r"^\S+\s+(\S+)\s+\d+\s+(\S+)", ln)
+        if m:
+            hosts.append(f"{m.group(2)} ({m.group(1)})")
+    return list(dict.fromkeys(hosts))
+
+
+def _enum_share_acls(cfg: Config, subnet: str, auth: list[str]) -> list[str]:
+    """nxc smb --shares → classify Readable / Writable shares. Writes
+    access-shares.txt; returns 'HOST\\tshare\\tPERMS' rows."""
+    out_file = cfg.work_dir / "access-shares.txt"
+    run(["nxc", "smb", subnet] + auth + ["--shares"], cfg, timeout=300, outfile=out_file)
+    if not out_file.exists():
+        return []
+    perm_tokens = {"READ", "WRITE", "READ,WRITE", "WRITE,READ"}
+    rows: list[str] = []
+    for ln in out_file.read_text(errors="replace").splitlines():
+        toks = ln.split()
+        # columns: PROTO ip port HOST ShareName PERMS [remark...]
+        idx = next((i for i, t in enumerate(toks) if t in perm_tokens), None)
+        if idx is None or idx < 5 or len(toks) < 5:
+            continue
+        host, share, perms = toks[3], toks[4], toks[idx]
+        rows.append(f"{host}\t{share}\t{perms}")
+    rows = list(dict.fromkeys(rows))
+    if rows:
+        out_file.write_text("\n".join(rows) + "\n")
+        writable = [r for r in rows if "WRITE" in r]
+        ok(f"shares: {len(rows)} readable/writable ({len(writable)} writable)")
+        for r in rows[:10]:
+            detail(r.replace("\t", "  "))
+    return rows
+
+
+def enumerate_access_surface(cfg: Config) -> dict:
+    """Surface reachable access as findings across the subnet with netexec:
+    RDP, WinRM/PS-Remoting, Guest SMB sessions, and share ACLs. Read-only —
+    reports where a controlled principal already has access; runs no exploit.
+    (DCOM-exec capability is not probed separately: it reduces to local-admin,
+    already surfaced via the AdminTo extraction in the BloodHound phase.)
+    Writes access-*.txt to work_dir; returns a dict of finding lists."""
+    if not (tool_exists("nxc") and cfg.has_creds):
+        return {}
+    subnet = cfg.target_net or cfg.specific_target or cfg.dc_ip
+    if not subnet:
+        return {}
+    auth = _nxc_auth_args(cfg)
+    separator()
+    log.info(f"🔍 Enumerating access surface across {subnet} (RDP/WinRM/guest/shares)...")
+    findings: dict[str, list[str]] = {}
+
+    for proto, label in (("rdp", "rdp-access"), ("winrm", "winrm-access")):
+        out_file = cfg.work_dir / f"access-{label}.txt"
+        run(["nxc", proto, subnet] + auth, cfg, timeout=300, outfile=out_file)
+        hosts = _nxc_hosts_on_hit(out_file.read_text(errors="replace")) if out_file.exists() else []
+        if hosts:
+            ok(f"{label}: {len(hosts)} host(s)")
+            for h in hosts[:10]:
+                detail(h)
+            findings[label] = hosts
+
+    # Guest / null SMB session accepted
+    guest_file = cfg.work_dir / "access-guest.txt"
+    run(["nxc", "smb", subnet, "-u", "Guest", "-p", ""], cfg, timeout=300, outfile=guest_file)
+    guest_hosts = _nxc_hosts_on_hit(guest_file.read_text(errors="replace")) if guest_file.exists() else []
+    if guest_hosts:
+        ok(f"guest-session: {len(guest_hosts)} host(s) accept Guest/null SMB")
+        for h in guest_hosts[:10]:
+            detail(h)
+        findings["guest-session"] = guest_hosts
+
+    shares = _enum_share_acls(cfg, subnet, auth)
+    if shares:
+        findings["shares"] = shares
+
+    if not findings:
+        detail("No additional access surface found (RDP/WinRM/guest/shares)")
+    return findings
+
+
 def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
     """Find relay targets and delegation hosts. Returns (relay_targets, deleg_hosts)."""
     phase_header(f"PHASE 1: TARGET ENUMERATION ({cfg.target_net})")
@@ -1644,6 +1732,12 @@ def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
 
     if high_value:
         (cfg.work_dir / "high-value-targets.txt").write_text("\n".join(high_value) + "\n")
+
+    # --- Access-surface findings (RDP / WinRM / Guest / share ACLs) ---
+    try:
+        enumerate_access_surface(cfg)
+    except Exception as e:
+        log.warning(f"Access-surface enumeration failed: {e}")
 
     return relay_targets, deleg_hosts
 
