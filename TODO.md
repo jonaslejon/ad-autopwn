@@ -67,14 +67,14 @@ not Domain, in the current edge extraction.
 
 ---
 
-## P2 — Initial-access / pre-auth findings (missing)
+## ✅ DONE (M4) — Initial-access / pre-auth findings
 
-- [ ] **Anonymous LDAP Bind** — detect + dump directory over an anonymous bind. `T1087.002`
-- [ ] **Blank Password** — test accounts for empty passwords. `T1110.001`
-- [ ] **Username as Password** — test `sAMAccountName == password` across discovered users. `T1110.003`
-      (Cheap add to the existing `discover`/spray path — we already have `pre2k` + single-password spray.)
-- [ ] **Group Policy Preferences (GPP) cpassword** — decrypt `cpassword` from SYSVOL Groups.xml etc.
-      We currently run only `nxc -M gpp_autologin` (registry autologon), **not** GPP `cpassword` recovery. `T1552.006`
+Shipped in PRs #6/#7/#8, folded into the `discover` + `enrich` batteries (no new phase).
+
+- [x] **Anonymous LDAP Bind** — `_anonymous_ldap_bind` (nxc null bind + anonymous ldapsearch Root DSE). `T1087.002`
+- [x] **Blank Password** — `_test_weak_credentials` (nxc `-p ''`). On by default (`--no-weak-pw` to skip). `T1110.001`
+- [x] **Username as Password** — `_test_weak_credentials` (nxc `--no-bruteforce`, user list as password file). `T1110.003`
+- [x] **Group Policy Preferences (GPP) cpassword** — `gpp_password` module added to the nxc battery + `consume_nxc_findings` parser → `enrich-gpp.txt`. `T1552.006`
 
 ---
 
@@ -89,16 +89,15 @@ not Domain, in the current edge extraction.
 
 ---
 
-## P2 — Lateral-movement surface findings (missing)
+## ✅ DONE (M5) — Lateral-movement surface findings
 
-We extract AdminTo hosts and do PtH reuse, but don't enumerate these access surfaces as findings:
+Shipped in PR #9 as `enumerate_access_surface`, called from `enumerate_targets` (so `--phase enum` + full-auto both run it). Findings → `access-*.txt`.
 
-- [ ] **RDP Access** — flag hosts where a controlled principal has interactive RDP. `T1021.001`
-- [ ] **PowerShell Remoting / WinRM Access** — flag WinRM exec capability as a finding (we only *suggest* evil-winrm in output). `T1021.006`
-- [ ] **DCOM Execution** — detect remote DCOM exec capability. `T1021.003`
-- [ ] **Guest Session** — detect accepted guest SMB sessions. `T1135`
-- [ ] **Share ACL findings** — enumerate **Readable / Writable / Full-Control shares** as first-class findings.
-      We drop NTLM-theft files on writable shares but don't inventory share ACLs / hunt creds in share content. `T1039` / `T1570` / `T1552.001`
+- [x] **RDP Access** — `nxc rdp` across the subnet. `T1021.001`
+- [x] **PowerShell Remoting / WinRM Access** — `nxc winrm`, surfaced as a finding (not just an evil-winrm hint). `T1021.006`
+- [x] **Guest Session** — `nxc smb -u Guest -p ''`. `T1135`
+- [x] **Share ACL findings** — `nxc smb --shares`, classified Readable / Writable / Full-Control (`_enum_share_acls`). `T1039` / `T1570`
+- [~] **DCOM Execution** — deliberately **not** probed separately: it reduces to local-admin, already surfaced by the AdminTo extraction in the BloodHound phase. `T1021.003`
 
 ---
 
@@ -152,11 +151,11 @@ For scope clarity (do **not** add these; we already have them and adscan does no
 ## Suggested order of attack
 
 - ~~**MSSQL suite**~~ — descoped (owner decision).
-- ~~**Weaponize detected ACL edges** (P1)~~ — ✅ done in v4.13.0.
+- ~~**Weaponize detected ACL edges** (P1)~~ — ✅ done in v4.13.0 (PR #5).
+- ~~**Initial-access cheap wins** (P2)~~ — ✅ done (PRs #6/#7/#8).
+- ~~**Enumeration findings** (P2)~~ — ✅ done (PR #9).
 
 Remaining:
 
-1. **Initial-access cheap wins** (P2) — blank / username-as-password / anonymous-bind / GPP cpassword.
-2. **RODC suite** (P1) — self-contained family; only matters when an RODC is present.
-3. **Enumeration findings** (P2) — RDP/WinRM/DCOM/guest/share-ACL surfacing.
-4. **Trust abuse, privileged-group privesc, CVE detections, ESC17** (P2–P3).
+1. **RODC suite** (P1) — self-contained family; only matters when an RODC is present. Needs full-GOAD to validate.
+2. **Trust abuse, privileged-group privesc, CVE detections, ESC17** (P2–P3) — mostly detections.
