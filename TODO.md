@@ -1,5 +1,22 @@
 # TODO — Technique Gap vs. ADScanPro/adscan
 
+## ⚠️ Bugs found by live L2 testing (2026-09-11)
+
+- [x] **BUG 1 (high):** backgrounded `ntlmrelayx` dies on stdin-EOF → every relay
+  phase (`arp`, DC relay) captures nothing and the ARP spoof is torn down in ~2 s.
+  Fix in `run()` bg branch (`ad-autopwn.py:409`): launch with `stdin=subprocess.PIPE`
+  and keep the handle open (`/dev/null` = EOF, does not work). Also bump the 2 s
+  settle check at `:1288`. Validated: `sleep infinity | ntlmrelayx` stays up.
+- [x] **BUG 2 (med):** prereq gate (`:1001`, exit at `:9924`) hard-fails *all* phases,
+  incl. `--dry-run`, when the CVE-2025-33073 PoC is absent. Make the PoC required
+  per-phase, or always let `--dry-run` through. Breaks the "dry-run first" workflow.
+- [x] **BUG 3 (low):** pipx tools (mitm6, coercer, wsuks, bloodyAD, sccmhunter) show
+  as "not found" because `sudo` strips `~/.local/bin` from PATH. Probe `SUDO_USER`'s
+  `~/.local/bin` in `tool_exists`.
+- [ ] README "Needs more testing": `arp` relay now validated live on-prem — blocked
+  only by BUG 1. `wsus`/`pxe` remain N/A on GOAD-Light (no WSUS/PXE services).
+
+
 Coverage gaps found by comparing **ad-autopwn** against **[ADScanPro/adscan](https://github.com/ADScanPro/adscan)**.
 This is a to-do list of techniques adscan implements that ad-autopwn **does not** — candidates to add.
 

