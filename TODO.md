@@ -1,4 +1,58 @@
-# TODO — Technique Gap vs. ADScanPro/adscan
+# TODO — Project Roadmap and Technique Gaps
+
+This file tracks prioritized work and completion status. Detailed design and
+implementation notes live in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md);
+keep the two files aligned when scope or milestones change.
+
+## Repository hardening roadmap (reviewed 2026-09-14)
+
+Complete these in order; dependency provenance should be settled before
+publishing a container image.
+
+1. [ ] **Resolve third-party licensing and provenance.** `cmc_addext.py` comes
+   from [MazX0p/cmc-addext](https://github.com/MazX0p/cmc-addext), which currently
+   publishes no explicit license. Obtain redistribution permission or stop
+   vendoring it and install it separately. Add `THIRD_PARTY_NOTICES.md` with the
+   upstream URL, pinned commit, copyright holder, modifications, and license for
+   every bundled third-party component.
+2. [ ] **Prevent accidental publication of sensitive artifacts.** Expand
+   `.gitignore` beyond Python caches to cover `.DS_Store`, virtual environments,
+   default `ad-autopwn-*` run directories, PCAPs, PFX files, ccaches, kirbi files,
+   hashes, and other generated secrets. Prefer one documented output root so the
+   ignore rules remain narrow and reviewable.
+3. [ ] **Add `SECURITY.md` and private vulnerability reporting.** Document the
+   supported version policy, how to report unsafe behavior or exposed secrets,
+   what evidence to include, and that client names, domains, credentials, hashes,
+   and engagement output must be sanitized. Enable GitHub private vulnerability
+   reporting instead of directing sensitive reports to public issues.
+4. [ ] **Add safe CI and protect `main`.** Create a GitHub Actions workflow for
+   Python compilation, `ad-autopwn.py --help`, CLI/README consistency, dependency
+   imports, and unit tests for pure logic. Never contact a target or run live
+   attack phases in CI. Protect `main` from deletion and force-pushes and require
+   the CI check; mandatory PR reviews can wait while there is one maintainer.
+5. [ ] **Add contributor/community files.** Add `CONTRIBUTING.md`,
+   `CODE_OF_CONDUCT.md`, sanitized bug and feature issue forms, and a pull-request
+   template. Bug reports should include version, OS, Python, phase, relevant
+   external-tool versions, a minimal reproduction, and redacted output.
+6. [ ] **Establish release and version discipline.** Add `--version`, make one
+   source authoritative for the version, create `CHANGELOG.md`, tag releases, and
+   publish GitHub releases. Start with a curated v4.13.0 release rather than
+   automating an unproven release process.
+7. [ ] **Make installation reproducible.** Add `pyproject.toml` with Python
+   `>=3.10`, package metadata, development checks, and console entry points.
+   Record exact commits/checksums for `/opt/tools` dependencies in a lock manifest
+   and distinguish required, phase-specific, and optional tools.
+8. [ ] **Add a scoped Docker runtime.** Build only after item 7. Start with the
+   authenticated and non-L2 phases, a mounted output directory, pinned tools, and
+   an image smoke test. Document Linux host networking and opt-in
+   `NET_RAW`/`NET_ADMIN`/`NET_BIND_SERVICE` capabilities for L2/listener phases;
+   avoid `--privileged` and explain Docker Desktop's L2 limitations.
+9. [ ] **Add dependency and release automation.** Configure Dependabot for Python
+   and GitHub Actions after CI exists. Add automatic release-note generation only
+   after the manual changelog/tag workflow has been used successfully.
+10. [ ] **Consider optional project metadata.** Add `CITATION.cff` if academic or
+    research citation matters, `FUNDING.yml` if sponsorship is wanted, and a
+    devcontainer only after the development/container environment is stable.
 
 ## ⚠️ Bugs found by live L2 testing (2026-09-11)
 
@@ -17,37 +71,36 @@
   only by BUG 1. `wsus`/`pxe` remain N/A on GOAD-Light (no WSUS/PXE services).
 
 
-Coverage gaps found by comparing **ad-autopwn** against **[ADScanPro/adscan](https://github.com/ADScanPro/adscan)**.
-This is a to-do list of techniques adscan implements that ad-autopwn **does not** — candidates to add.
+## Technique coverage backlog
 
-## Method / sources
+This is a prioritized list of useful techniques that ad-autopwn does not yet
+implement, plus completed work retained for historical context.
 
-- **adscan side:** its own `COVERAGE.md` (auto-generated from the product catalog),
-  cloned `2026-09-10`. It advertises "105 techniques"; the generated catalog lists
-  **104 techniques across 15 categories** (71 executed end-to-end, AD CS ESC1–ESC17).
-  Note: `COVERAGE.md` counts *detections* and *attack-path pivots* as techniques, not
-  just executed exploits — so the raw 104 is inflated relative to "things it actually runs."
-- **ad-autopwn side:** verified against `ad-autopwn.py` source (not just the README) —
-  grepped for each candidate primitive and the `nxc` enrichment battery module list.
+## Review method
 
-**Rough scorecard:** ad-autopwn has parity-or-better on ~45 of adscan's 104 catalog entries.
-The list below is what's genuinely missing plus a smaller "detected but not weaponized"
-set. Because ad-autopwn is an *orchestrator*, most gaps are "wire up an existing tool"
-(nxc / certipy / bloodyAD / impacket) rather than net-new protocol code.
+- Coverage was verified against `ad-autopwn.py` source, rather than relying only
+  on README claims, including the NetExec enrichment battery and BloodHound
+  auto-action mappings.
+- Detections, attack-path pivots, and executed exploits are treated as different
+  levels of coverage; a detection alone is not counted as end-to-end support.
+
+Because ad-autopwn is an orchestrator, most gaps involve integrating an existing
+tool such as NetExec, Certipy, bloodyAD, or Impacket rather than implementing a
+protocol from scratch.
 
 Priority key: **P1** = high-value / commonly needed on engagements · **P2** = useful, moderate effort · **P3** = niche / detection-only parity.
 
 > **Scope decisions**
-> - **MSSQL suite — descoped** (owner decision). adscan's 10 MSSQL techniques are intentionally
->   out of scope for ad-autopwn and are not tracked here.
+> - **MSSQL suite — descoped** (owner decision) and not tracked here.
 > - **ACL-edge weaponization — DONE** in v4.13.0 (see the section below).
 
 ---
 
 ## P1 — Read-Only Domain Controller (RODC) suite (entire family missing)
 
-adscan has 5 RODC techniques; ad-autopwn has **none** (`rodc` = 0 hits in source).
-Relevant whenever the target env has an RODC. Tooling: `impacket`, `certipy`/`bloodyAD` for PRP edits.
+ad-autopwn currently has no RODC support (`rodc` = 0 hits in source). This suite
+is relevant when the target environment contains an RODC. Tooling candidates:
+Impacket, Certipy, and bloodyAD for PRP edits.
 
 - [ ] **RODC Password Replication Policy Control** — modify the RODC's `msDS-RevealOnDemandGroup` / PRP. `T1098`
 - [ ] **RODC Credential Caching** — force target creds to cache on a controlled/compromised RODC. `T1098`
@@ -120,7 +173,7 @@ Shipped in PR #9 as `enumerate_access_surface`, called from `enumerate_targets` 
 
 ## P2 — Privilege escalation via privileged groups (mostly missing)
 
-We already have **Backup Operators (DRSR)** ✅. adscan additionally covers:
+We already have **Backup Operators (DRSR)**. Additional useful gaps are:
 
 - [ ] **DnsAdmins Abuse** — DNS server DLL load → SYSTEM on the DC (detect; execution is destructive). `T1543.003`
 - [ ] **Print Operators Abuse** — driver-load / SeLoadDriverPrivilege escalation path. `T1547.006`
@@ -143,15 +196,15 @@ We already detect **Zerologon, noPac, PrintNightmare** in the enrich battery. Mi
 
 ## P3 — AD CS
 
-We cover **ESC1–ESC16** via certipy, plus our unique **ESC1-CMC (KB5014754) bypass**. Missing:
+We cover **ESC1–ESC16** via Certipy, plus **ESC1-CMC (KB5014754)**. Missing:
 
-- [ ] **AD CS ESC17** — adscan lists ESC1–ESC17; we top out at ESC16. Add ESC17 detection/exploit. `T1557`
+- [ ] **AD CS ESC17** — add ESC17 detection and exploitation. `T1557`
 
 ---
 
-## Not gaps — where ad-autopwn already leads adscan
+## Existing strengths — not gaps
 
-For scope clarity (do **not** add these; we already have them and adscan does not):
+For scope clarity, these capabilities are already implemented:
 
 - **Layer-2 / passive:** ARP spoof + relay, WPAD/mitm6, **WSUS relay**, **PXE boot cred theft**,
   **SCCM NAA theft**, WebDAV coercion, DHCP coercion, NTLM-theft file drops.
