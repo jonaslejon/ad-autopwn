@@ -1,5 +1,10 @@
 # AD AutoPwn
 
+![Made with Python](https://img.shields.io/badge/made%20with-Python-3776AB?logo=python&logoColor=white)
+![AD AutoPwn](https://img.shields.io/badge/AD-AutoPwn-black)
+![Authorized Testing Only](https://img.shields.io/badge/use-authorized%20testing%20only-red)
+![Version](https://img.shields.io/badge/version-4.13.0-blue)
+
 **Zero-Auth to Domain Admin — Automated Active Directory Attack Chain**
 
 A fully automated penetration testing tool that chains 25+ attack
