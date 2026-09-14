@@ -11,7 +11,7 @@ A fully automated penetration testing tool that chains 25+ attack
 techniques to compromise Active Directory environments. Designed for
 authorized security assessments.
 
-![AD AutoPwn social preview](assets/social-preview.png)
+![AD AutoPwn banner](assets/readme-banner.png)
 
 ## Features
 
