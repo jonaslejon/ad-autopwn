@@ -414,7 +414,7 @@ that prompted the clearer banner and mandatory authorization warning.
 
 ## Author
 
-Triop AB — [https://triop.se](https://triop.se)
+Jonas Lejon — [@jonaslejon](https://github.com/jonaslejon)
 
 ### Bundled third-party tool
 
