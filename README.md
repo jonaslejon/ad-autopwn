@@ -13,16 +13,25 @@ authorized security assessments.
 
 ![AD AutoPwn banner](assets/readme-banner.png)
 
+[Usage](#usage) · [Phases](#available-phases) · [Arguments](#command-line-reference) ·
+[Dependencies & installation](#dependencies) · [Companion tools](#companion-tools) ·
+[Runtime & output](#runtime-behavior-and-output) · [Testing](#tested-against)
+
 ## Features
 
 ### Pre-auth username & credential discovery (zero creds)
+
 - **kerbrute** KRB-AS-REQ user enumeration (lockout-safe)
 - **CLDAP NetLogon ping** username enumeration (lockout-safe)
 - **AS-REP roast** of all candidates (free hashes for accounts with `DONT_REQ_PREAUTH`)
+- **Anonymous LDAP bind / Root DSE checks**
 - **pre2k auto-test** (Windows 2000 compatibility default-password machines)
-- **Single-password spray** (lockout-aware, opt-in via `--spray-password`)
+- **Blank-password and username-as-password checks** — enabled by default;
+  disable with `--no-weak-pw` (up to two authentication attempts per user)
+- **Single-password spray** — opt-in via `--spray-password`; one password per user
 
 ### Layer-2 / passive zero-auth attacks
+
 - **Passive network sniffing** — WPAD, WSUS, PXE, LLMNR, DHCPv6, TFTP, SCCM ProxyDHCP detection
 - **ARP spoof + NTLM relay** — capture and crack NTLMv2 hashes
 - **WPAD poisoning** — mitm6 / Responder IPv6 DNS hijack
@@ -33,20 +42,24 @@ authorized security assessments.
 - **DHCP coercion** — DHCP server machine account relay
 
 ### Authentication-reflection bypass (Synacktiv 2026)
+
 - **CVE-2025-58726 ghost-SPN** Kerberos AP-REQ reflection (auto-fired by BloodHound auto-action)
 - **CVE-2026-24294 LPE** — SMB-on-arbitrary-tcpport reflection (Win11 24H2 / Server 2025 pre-March-2026)
 - **CVE-2026-26128 LPE** — Kerberos loopback via Unicode SPN
 - **Unicode-SPN fallback** when CVE-2025-33073 path is patched
 
 ### Credential harvesting (post-auth)
+
 - **Kerberoasting** — extract and auto-crack SPN hashes (hashcat mode 13100/19700)
 - **AS-REP Roasting** — crack accounts without pre-auth (hashcat mode 18200)
 - **Timeroast** — SNTP-MS hashes from any domain-joined machine (hashcat mode 31300)
-- **gMSA managed-password read** — `nxc -M gmsa` in the enrichment battery turns
+- **gMSA managed-password read** — `nxc ldap --gmsa` in the enrichment battery turns
   a readable Group Managed Service Account's `msDS-ManagedPassword` blob directly
   into a pass-the-hash-able NT hash; `ReadGMSAPassword` ACEs are auto-fired as a
   BloodHound auto-action edge
 - **LAPS password recovery** + **userPassword LDAP attribute** + **description-leaked passwords** (mined from nxc enrichment battery)
+- **GPP cpassword recovery** — NetExec `gpp_password` results are parsed into
+  `enrich-gpp.txt`
 - **SCCM NAA theft** — extract Network Access Account credentials via sccmhunter
 - **NetNTLMv1 downgrade → machine NT hash** — coerce a host to a static-challenge
   Responder (ESS disabled), capture the NetNTLMv1 response, recover the machine
@@ -55,6 +68,7 @@ authorized security assessments.
   → local admin
 
 ### Graph-driven attack chains (BloodHound)
+
 - **`bloodhound-python -c All`** collection + ZIP analysis
 - **High-value findings** — Domain/Enterprise/Schema Admins, Kerberoastable, AS-REP roastable, unconstrained delegation, RBCD inbound, LAPS, AdminCount
 - **Actionable-edge analysis** — controlled-principal closure (you + transitive group memberships) → ACE edges where you are the principal: `WriteSPN`, `AddKeyCredentialLink`, `GenericAll/Write`, `WriteDacl/Owner`, `WriteAccountRestrictions`, `AddAllowedToAct`, `ForceChangePassword`
@@ -65,9 +79,16 @@ authorized security assessments.
   - `WriteSPN → ghost-SPN upgrade` (CVE-2025-58726)
   - `AddKeyCredentialLink → shadow credentials → PKINIT → NT hash`
   - `ReadGMSAPassword → gMSA managed-password read → NT hash`
-  - `GenericAll / WriteAccountRestrictions on Computer → RBCD chain → admin TGS`
+  - `GenericAll / GenericWrite / WriteAccountRestrictions / AddAllowedToAct on Computer → RBCD`
+  - `ForceChangePassword / AllExtendedRights on User → password reset`
+  - `GenericAll / GenericWrite on User → shadow credentials, then logon-script fallback`
+  - `GenericAll / GenericWrite on Group → add self to group`
+  - `WriteDacl / WriteOwner / Owns → GenericAll grant → takeover by object type`
+- **Access-surface enumeration** — RDP, WinRM, Guest SMB sessions, and share
+  permissions, saved to `access-*.txt` by `enum`
 
 ### Privilege escalation primitives
+
 - **AD CS exploitation** — ESC1-ESC16 via certipy (auto-enum + exploit)
   - ESC8 (web-enrollment relay)
   - ESC9/ESC10 UPN-swap (CVE-2022-26923 bypass)
@@ -87,12 +108,14 @@ authorized security assessments.
 - **GPO abuse** — pyGPOAbuse scheduled task as SYSTEM
 
 ### Domain compromise
+
 - **DCSync** — full domain hash dump via impacket-secretsdump
 - **DPAPI backup key** — extract domain DPAPI key for offline credential decryption
 - **AppLocker bypass** — LOLBins (mshta, certutil, regsvr32, etc.) + WSUS signed delivery
 - **WSUS update injection** — push malicious Windows Updates via wsuks
 
 ### Post-exploitation loot
+
 - **Local SAM / LSA / LSASS dump** — on every host where you hold local admin
   (compromised, AdminTo, or PtH-reuse hosts), run `nxc --sam --lsa` (+ optional
   `lsassy`) to harvest local NT hashes, cached domain creds (`$DCC2$`), service
@@ -110,6 +133,15 @@ confirmation that you have written permission and an agreed scope. Approved
 non-interactive automation can bypass the prompt with `--acknowledge-risk`.
 The warning is still displayed.
 
+Use **Linux with Python 3.10+**. Live `full` (the default), `arp`, `wpad`,
+`wsus`, and `sniff` runs require root, including `full` with credentials or
+`--no-arp --no-wpad`. Other phases can also need root when they start listeners,
+use raw sockets, or mount images. See [Dependencies](#dependencies) for setup.
+
+`python3 ad-autopwn.py --help` lists options and exits before discovery or the
+warning. The installed command is `ad-autopwn`; examples below run from this
+checkout.
+
 ```bash
 # Fully automated — zero-cred chain (prompts for authorization)
 sudo ./ad-autopwn.py
@@ -118,13 +150,13 @@ sudo ./ad-autopwn.py
 sudo ./ad-autopwn.py --acknowledge-risk
 
 # With credentials — full chain
-./ad-autopwn.py -u jsmith -p 'P@ss123' -d corp.local --dc-ip 10.0.0.1
+sudo ./ad-autopwn.py -u jsmith -p 'P@ss123' -d corp.local --dc-ip 10.0.0.1
 
 # AWS / VPC labs (Layer 2 attacks blocked) — auto-discovery still works
 sudo ./ad-autopwn.py --no-arp --no-wpad
 
-# Pre-auth credential discovery (lockout-safe)
-sudo ./ad-autopwn.py --phase discover --no-arp --no-wpad
+# Pre-auth discovery, with blank / username-as-password checks disabled
+./ad-autopwn.py --phase discover --no-weak-pw -d corp.local --dc-ip 10.0.0.1
 
 # BloodHound graph collection + automatic high-value analysis
 ./ad-autopwn.py --phase bloodhound -u user -p pass -d corp.local \
@@ -136,7 +168,7 @@ sudo ./ad-autopwn.py --phase discover --no-arp --no-wpad
 
 # RBCD+KCD chain — full ghost-SPN + RBCD + altservice rewrite, one shot
 ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
-                --phase rbcd-kcd -T VHAGAR$ --alt-spn HTTP/vhagar.corp.local
+                --phase rbcd-kcd -T 'VHAGAR$' --alt-spn HTTP/vhagar.corp.local
 
 # gMSA managed-password read → NT hash
 ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
@@ -149,16 +181,16 @@ sudo ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
 # NetNTLMv1 fast-path — chain a crack.sh-recovered DC hash straight to DCSync
 ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
                 --dc-fqdn dc01.corp.local --phase ntlmv1 \
-                --ntlmv1-nthash 'DC01$:e19ccf75ee54e06b06a5907af13cef42'
+                --ntlmv1-nthash 'DC01$:0123456789abcdef0123456789abcdef'
 
 # Loot — local SAM/LSA/LSASS dump + pass-the-hash reuse sweep
 ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
                 -t 10.0.0.0/24 --phase loot
 
 # AppLocker bypass
-./ad-autopwn.py -u user -p pass --applocker --lolbin mshta --custom-cmd "whoami"
+sudo ./ad-autopwn.py -u user -p pass --applocker --lolbin mshta --custom-cmd "whoami"
 
-# Dry run (print every command, run nothing — even background processes)
+# Preview attack commands (startup discovery may still probe the network)
 ./ad-autopwn.py --dry-run -u user -p pass -d corp.local --dc-ip 10.0.0.1
 ```
 
@@ -168,13 +200,13 @@ sudo ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
 |-------------------|--------|-------------|
 | `full`            | optional | Complete automated chain (auto-detects with or without creds) |
 | `sniff`           | none   | Passive L2 traffic discovery |
-| `discover`        | none   | kerbrute + CLDAP + AS-REP + pre2k + (opt-in) spray |
+| `discover`        | none   | Anonymous LDAP + kerbrute + CLDAP + AS-REP + pre2k + weak-password checks + opt-in spray |
 | `arp`             | none   | ARP spoof + NTLM capture |
 | `wpad`            | none   | WPAD/LLMNR poisoning (mitm6 / Responder) |
 | `wsus`            | none   | WSUS NTLM relay |
 | `pxe`             | none   | PXE boot credential theft |
-| `enum`            | yes    | Target enumeration (relay targets, unconstrained delegation, WebClient hosts) |
-| `enrich`          | yes    | nxc 14-module battery (gMSA, LAPS, timeroast, MAQ, nopac, zerologon, …) + auto-consumer |
+| `enum`            | yes    | Relay targets, delegation, WebClient, RDP/WinRM access, Guest sessions and share permissions |
+| `enrich`          | yes    | 15 NetExec checks (14 modules + `--gmsa`), including GPP, LAPS and timeroast; consumes findings |
 | `gmsa`            | yes    | Read a gMSA's managed password → NT hash (`-T <gmsa_account>`) |
 | `bloodhound`      | yes    | `bloodhound-python -c All` + analysis (incl. AdminTo) + auto-action chains |
 | `roast`           | yes    | Kerberoast + AS-REP Roast |
@@ -182,135 +214,463 @@ sudo ./ad-autopwn.py -u user -p pass -d corp.local --dc-ip 10.0.0.1 \
 | `sccm`            | yes    | SCCM NAA credential theft |
 | `exploit`         | yes    | NTLM reflection / coercion exploit on a specific target |
 | `ntlmv1`          | yes¹   | NetNTLMv1 downgrade → machine NT hash → DCSync / self-takeover |
-| `dcsync`          | yes (DA) | Domain hash dump |
+| `dcsync`          | yes    | DC compromise / domain hash dump; requires `-T <target>` and replication rights or a viable escalation path |
 | `loot`            | yes    | Local SAM/LSA/LSASS dump + PtH reuse + cmdline harvest + KeePass |
-| `tgs-rewrite`     | none   | Offline ccache sname rewrite (tgssub-style KCD bypass) |
+| `tgs-rewrite`     | none   | ccache sname rewrite; requires `--in-ccache` and `--alt-spn` (startup still performs discovery) |
 | `dollar-ticket`   | yes    | KDC `$`-suffix retry attack (Linux GSSAPI target) |
 | `rbcd-kcd`        | yes    | Full RBCD+KCD chain orchestrator (WriteSPN → ghost → RBCD → S4U+altservice) |
-| `reflect-tcpport` | yes    | CVE-2026-24294 LPE primitive (SMB-on-tcpport) |
-| `reflect-loopback`| yes    | CVE-2026-26128 LPE primitive (Kerberos loopback via Unicode SPN) |
+| `reflect-tcpport` | none   | Generates a foothold trigger script and starts a relay listener; manual steps required |
+| `reflect-loopback`| yes    | Registers Unicode DNS, generates a foothold script and starts krbrelayx; manual steps required |
 | `kerb-reflect`    | yes    | CVE-2025-58726 ghost-SPN AP-REQ reflection |
 
 ¹ `ntlmv1` live capture needs **root** (Responder) + a listener IP (`-a`) and
 creds to drive coercion. The `--ntlmv1-nthash 'ACCOUNT$:<nthash>'` fast-path
-(chaining a hash you already recovered from crack.sh) needs neither root nor a
-listener. In `full`/full-auto the downgrade fires automatically when root + a
-listener are available (opt out with `--no-ntlmv1`).
+(chaining a hash you already recovered from crack.sh) needs neither root, a
+listener, nor separate `-u`/`-p` credentials. In `full`/full-auto the downgrade
+fires automatically when root + a listener are available (opt out with `--no-ntlmv1`).
+
+## Command-line reference
+
+This is the complete `ad-autopwn.py` option list for v4.13.0, including aliases
+and parser defaults. `unset` means an empty string. Boolean flags default to
+`off`; for a `--no-*` flag, that means its corresponding step remains enabled.
+Skip flags apply only where the selected flow checks them; they are not global
+prohibitions on a technique. For example, `--no-roast` does not suppress AS-REP
+roasting inside `discover`.
+
+### Credentials
+
+| Argument | Default | Description |
+|---|---|---|
+| `-u USER`, `--user USER` | `unset` | Domain username |
+| `-p PASSWORD`, `--password PASSWORD` | `unset` | Domain password |
+| `-H NTHASH`, `--hash NTHASH` | `unset` | NT hash for pass-the-hash; supply the 32-hex NT part, without an LM prefix. |
+
+### Network
+
+| Argument | Default | Description |
+|---|---|---|
+| `-d DOMAIN`, `--domain DOMAIN` | `unset` | Target domain |
+| `-a ATTACKER_IP`, `--attacker-ip ATTACKER_IP` | `unset` | Attacker IP |
+| `-i IFACE`, `--iface IFACE` | `unset` | Network interface |
+| `-t TARGET_NET`, `--target-net TARGET_NET` | `unset` | Target subnet CIDR |
+| `-T SPECIFIC_TARGET`, `--target SPECIFIC_TARGET` | `unset` | Target IP/FQDN for host phases; account name for `gmsa` / `rbcd-kcd`. See phase requirements. |
+| `--dc-ip DC_IP` | `unset` | Domain controller IP |
+| `--dc-fqdn DC_FQDN` | `unset` | Domain controller FQDN |
+| `--gateway GATEWAY` | `unset` | Gateway IP for ARP spoof |
+
+### Attack options
+
+| Argument | Default | Description |
+|---|---|---|
+| `-m METHOD`, `--method METHOD` | `unset` | Coercion method: `DFSCoerce`, `PetitPotam`, `PrinterBug`, `ShadowCoerce`, or `MSEven`; unset tries the chain. |
+| `--custom-cmd CUSTOM_CMD` | `unset` | Custom command on target |
+| `-s`, `--socks` | `off` | SOCKS proxy mode |
+| `--smb-signing` | `off` | Bypass SMB signing (LDAPS) |
+| `--no-dcsync` | `off` | Skip scheduled DC-compromise steps in the full chain; does not override explicit `--phase dcsync` or every nested action. |
+| `--no-cleanup` | `off` | Keep records/changes at cleanup sites that honor this flag; background processes still stop. See Safety. |
+| `--no-arp` | `off` | Disable ARP spoof fallback |
+| `--batch` | `off` | Exploit all relay targets |
+| `--poison-duration SECONDS` | `120` | Capture/poison/listener timeout in seconds; some phases cap or adjust this window. |
+| `--exclude EXCLUDE` | `unset` | **Currently unused:** parsed but never applied to target selection. Does not exclude any IPs. |
+
+### WPAD / WSUS attacks
+
+| Argument | Default | Description |
+|---|---|---|
+| `--wsus-server WSUS_SERVER` | `unset` | WSUS server IP (auto-detected if omitted) |
+| `--wsus-port WSUS_PORT` | `0` | WSUS port; `0` selects `8530` for HTTP or `8531` with `--wsus-https`. |
+| `--wsus-https` | `off` | WSUS uses HTTPS (port 8531) |
+| `--wsus-certfile WSUS_CERTFILE` | `unset` | TLS cert for WSUS HTTPS interception |
+| `--wsus-keyfile WSUS_KEYFILE` | `unset` | TLS key for WSUS HTTPS interception |
+| `--no-wpad` | `off` | Skip WPAD poisoning in full auto |
+| `--no-wsus` | `off` | Skip WSUS attacks in full auto |
+| `--sniff-duration SECONDS` | `30` | Passive sniff duration in seconds (default: 30) |
+
+### AppLocker bypass
+
+| Argument | Default | Description |
+|---|---|---|
+| `--applocker` | `off` | Enable AppLocker bypass: use LOLBins, trusted paths, WSUS signed delivery |
+| `--lolbin LOLBIN` | `unset` | LOLBIN selection: `mshta`, `certutil`, `msbuild`, `regsvr32`, `rundll32`, `wmic`, `cmstp`; unset auto-selects. |
+| `--payload-url PAYLOAD_URL` | `unset` | URL of payload for LOLBin download-and-execute |
+
+### Advanced attacks
+
+| Argument | Default | Description |
+|---|---|---|
+| `--no-adcs` | `off` | Skip AD CS exploitation |
+| `--ca-name CA_NAME` | `unset` | Certificate Authority name (auto-detected) |
+| `--esc-victim ESC_VICTIM` | `unset` | ESC9/ESC10 UPN-swap account as `USER:PASS`; requires permission to change its UPN. |
+| `--no-roast` | `off` | Skip Kerberoasting / AS-REP Roasting |
+| `--no-ntlm-theft` | `off` | Skip NTLM theft file drops on writable shares |
+| `--no-sccm` | `off` | Skip SCCM NAA credential theft |
+| `--sccm-server SCCM_SERVER` | `unset` | SCCM Management Point (auto-detected) |
+| `--no-shadow-creds` | `off` | Skip shadow credentials (use RBCD instead) |
+| `--no-rbcd` | `off` | Skip RBCD delegation abuse |
+| `--machine-account MACHINE_ACCOUNT` | `unset` | Pre-created machine account; supply together with `--machine-password` to reuse it. |
+| `--machine-password MACHINE_PASSWORD` | `unset` | Password for `--machine-account`; otherwise the RBCD path creates an account. |
+| `--no-ntlmv1` | `off` | Skip automatic NetNTLMv1 downgrade. |
+| `--ntlmv1-nthash NTLMV1_NTHASH` | `unset` | Recovered machine hash as `ACCOUNT$:32-hex-nthash`; skips live capture in `ntlmv1`. |
+| `--alt-spn ALT_SPN` | `unset` | Alternate SPN as `service/host`; used by getST `-altservice` and `tgs-rewrite`. |
+| `--in-ccache IN_CCACHE` | `unset` | Input ccache for --phase tgs-rewrite |
+| `--target-user TARGET_USER` | `unset` | Linux username for opt-in `dollar-ticket`; also accepted as the account selector for `gmsa`. |
+| `--no-dpapi` | `off` | Skip DPAPI backup key extraction after DCSync |
+| `--no-bloodhound` | `off` | Skip BloodHound -c All collection + automatic analysis |
+| `--no-bh-auto-action` | `off` | Collect/analyze BloodHound data without automatically acting on ACL edges (including password resets and group changes). |
+| `--no-loot` | `off` | Skip automatic local-secret dumps, hash-reuse sweep, command-line harvest and KeePass discovery/cracking. |
+
+### Credential Discovery (zero-auth foothold)
+
+| Argument | Default | Description |
+|---|---|---|
+| `--no-discover` | `off` | Skip pre-cut credential discovery phase |
+| `--users-file USERS_FILE` | `unset` | Candidate usernames, one per line; blank lines and lines starting with `#` are ignored. Unset merges curated names with SecLists. |
+| `--spray-password SPRAY_PASSWORD` | `unset` | One explicit password to test across discovered users; adds an attempt per user to other enabled checks. Unset disables this spray. |
+| `--no-weak-pw` | `off` | Skip blank-password and username-as-password tests (enabled by default, up to two authentication attempts per user). Does not disable pre2k or `--spray-password`. |
+
+### Authentication reflection
+
+| Argument | Default | Description |
+|---|---|---|
+| `--unicode-spn` | `off` | Try Kerberos AP-REQ reflection via Unicode-SPN collision when NTLM methods fail |
+| `--no-ghost-spn` | `off` | Skip CVE-2025-58726 ghost-SPN upgrade after a successful relay |
+| `--no-loopback-check` | `off` | Skip Win11 24H2 / Server 2025 fingerprint during enum (LPE candidates) |
+| `--reflect-host REFLECT_HOST` | `unset` | Foothold IP/FQDN for reflection scripts/listeners; use this rather than `-T` for `reflect-*`. |
+| `--reflect-port REFLECT_PORT` | `12345` | High TCP port for SMB-on-tcpport (CVE-2026-24294, default: 12345) |
+
+### Execution
+
+| Argument | Default | Description |
+|---|---|---|
+| `-h`, `--help` | — | Show help and exit before startup. |
+| `--phase PHASE` | `full` | Select one of the 24 phases listed above; omitted means the full chain. |
+| `--dry-run` | `off` | Print attack commands without launching them; discovery, capability checks and local output writes can still occur. See Runtime behavior. |
+| `--acknowledge-risk` | `off` | Confirm written authorization and bypass the interactive safety prompt |
+| `-v`, `--verbose` | `off` | Debug output |
+| `-o OUTPUT`, `--output OUTPUT` | `unset` | Output directory; unset creates `./ad-autopwn-YYYYMMDD-HHMMSS`. An absolute path is recommended for tools that change directory. |
 
 ## Dependencies
 
-### Python (this repo)
+### Runtime and required tools
 
-`ad-autopwn.py` itself is pure standard library. The bundled companion tools
-(`cmc_addext.py`, `userenum-cldap.py`) need a few packages — install them with:
+The orchestrator requires **Python 3.10+** (it uses `match` statements) and Linux
+networking/process APIs. Importing the main script and displaying `--help` need only the standard library. Some
+runtime paths also import `asn1tools` or Impacket; the bundled helpers have the
+Python dependencies listed below. External tools may require a newer Python;
+for example, current [sccmhunter source metadata](https://github.com/garrettfoster13/sccmhunter/blob/main/pyproject.toml)
+requires Python 3.13+.
+
+For every live phase, `check_prerequisites()` requires these executable names:
+
+| Executable | Kali package |
+|---|---|
+| `python3` | `python3` |
+| `ip` | `iproute2` |
+| `nxc` | `netexec` |
+| `impacket-findDelegation`, `impacket-ntlmrelayx`, `impacket-secretsdump` | `impacket-scripts` |
+
+`full`, `exploit`, and `dcsync` additionally require
+`/opt/tools/CVE-2025-33073/CVE-2025-33073.py`. Other phases warn if that PoC is
+absent. These checks also apply to `tgs-rewrite`, despite the rewrite itself
+being a local operation. `--dry-run` continues past missing prerequisites;
+`--help` bypasses the checks entirely. Optional-tool warnings do not block
+startup, but the affected steps may be skipped or fail. The checker does not
+validate every dependency, Python package, module, or upstream CLI version.
+
+### Python packages in this repository
+
+[requirements.txt](requirements.txt) declares minimum versions, not a locked or
+fully tested combination of external tools:
+
+| Package | Minimum | Used by |
+|---|---|---|
+| `impacket` | `0.11.0` | CMC RPC submission; inline ccache rewrite and relay compatibility inspection in the main script |
+| `cryptography` | `41.0.0` | CMC certificates, keys and PFX files |
+| `ldap3` | `2.9.1` | CMC LDAP queries |
+| `requests` | `2.28.0` | CMC HTTP/CES submission |
+| `urllib3` | `1.26.0` | CMC HTTPS handling |
+| `asn1tools` | `0.166.0` | CLDAP helper; availability check in the main script |
+
+Install into the interpreter used to launch the scripts:
 
 ```bash
-pip install -r requirements.txt   # add --break-system-packages on Kali
+python3 -m pip install -r requirements.txt
 ```
 
-On Kali most of these already ship via `impacket-scripts` / `certipy-ad`.
+For the system Python on a dedicated Kali installation, use
+`sudo python3 -m pip install --break-system-packages -r requirements.txt`.
+Repository-based tools are invoked with `python3`, so their dependencies must
+also be visible to that interpreter. If using a virtual environment, preserve
+its `bin` directory in `PATH` when running under `sudo`.
 
-### APT (Kali Linux)
+### Kali packages
+
+This installs the required executables plus the packaged optional tools:
 
 ```bash
-apt install python3 impacket-scripts netexec nmap hashcat tcpdump \
-  responder dsniff arp-scan certipy-ad bloodyad bloodhound.py \
-  smbclient atftp wimtools john seclists
+sudo apt update
+sudo apt install python3 python3-pip python3-venv pipx git wget \
+  iproute2 dnsutils ldap-utils iptables nftables python3-nftables \
+  openssl procps bash coreutils gzip \
+  impacket-scripts netexec nmap hashcat tcpdump responder dsniff arp-scan \
+  certipy-ad bloodyad bloodhound.py smbclient atftp wimtools john seclists
 ```
 
-### Git repositories (clone to `/opt/tools/`)
+| Tool / package | Purpose or alternative |
+|---|---|
+| `dig` (`dnsutils`), `ldapsearch` (`ldap-utils`) | DNS/domain/DC discovery and anonymous LDAP checks |
+| `nmap`, `arp-scan` | Host and service discovery; `nmap` is preferred for host discovery |
+| `tcpdump` | Passive traffic discovery |
+| `arpspoof` (`dsniff`) | ARP spoofing; `bettercap` is an alternative |
+| `responder` | LLMNR/WPAD capture and NetNTLMv1 capture |
+| `iptables`, `openssl` | WSUS traffic redirection and certificate conversion |
+| `nftables`, `python3-nftables` | Required by [wsuks](https://pypi.org/project/wsuks/) |
+| `hashcat`, `john`, `keepass2john` (`john`) | Hash cracking and KeePass conversion; John substitutes for Hashcat only on some NTLMv2 paths |
+| `seclists` | Username candidates and password wordlists; RockYou is searched under `/usr/share/wordlists/` |
+| `atftp` | PXE downloads; `tftp` is an alternative |
+| `wimlib-imagex`, `wimmountrw`, `wimumount` (`wimtools`) | WIM extraction/mounting and cleanup |
+| `smbclient` | SMB file upload/download, including KeePass retrieval |
+| `bloodhound-python` (`bloodhound.py`) | Graph collection; local analysis does not require a BloodHound server or Neo4j |
+| `certipy` (`certipy-ad`), `bloodyAD` (`bloodyad`) | AD CS and LDAP modification helpers; see executable-name notes below |
+| `impacket-GetUserSPNs`, `impacket-GetNPUsers`, `impacket-addcomputer`, `impacket-getST`, `impacket-getTGT`, `impacket-rbcd`, `impacket-dpapi`, `impacket-reg` | Additional phase-specific commands from `impacket-scripts` |
+| `bash`, `tee` (`coreutils`), `gunzip` (`gzip`), `pgrep` (`procps`) | Enumeration pipelines, wordlist decompression and process checks |
+
+The code invokes **`certipy`** and **`bloodyAD`** with those exact spellings.
+Kali documents the packaged binaries as [certipy-ad](https://www.kali.org/tools/certipy-ad/)
+and [bloodyad](https://www.kali.org/tools/bloodyad/). If only those names exist,
+create executable aliases (interactive shell aliases are not used by subprocesses):
 
 ```bash
-git clone https://github.com/mverschu/CVE-2025-33073        /opt/tools/CVE-2025-33073
-git clone https://github.com/dirkjanm/krbrelayx              /opt/tools/krbrelayx
-git clone https://github.com/Wh04m1001/DFSCoerce             /opt/tools/DFSCoerce
-git clone https://github.com/ShutdownRepo/ShadowCoerce       /opt/tools/ShadowCoerce
-git clone https://github.com/ShutdownRepo/pywhisker          /opt/tools/pywhisker
-git clone https://github.com/dirkjanm/PKINITtools            /opt/tools/PKINITtools
-git clone https://github.com/csandker/pxethiefy              /opt/tools/pxethiefy
-git clone https://github.com/garrettfoster13/sccmhunter      /opt/tools/sccmhunter
-git clone https://github.com/dirkjanm/mitm6                  /opt/tools/mitm6
-git clone https://github.com/Hackndo/pyGPOAbuse              /opt/tools/pyGPOAbuse
-git clone https://github.com/Hackndo/WebclientServiceScanner /opt/tools/WebclientServiceScanner
-git clone https://github.com/almandin/Certihound             /opt/tools/Certihound
+if ! command -v certipy >/dev/null 2>&1; then
+  sudo ln -s "$(command -v certipy-ad)" /usr/local/bin/certipy
+fi
+if ! command -v bloodyAD >/dev/null 2>&1; then
+  sudo ln -s "$(command -v bloodyad)" /usr/local/bin/bloodyAD
+fi
 ```
 
-### Pipx packages
+Use Kali's [impacket-scripts](https://www.kali.org/tools/impacket-scripts/) wrappers
+with a compatible Impacket library. Installing the Python package alone does
+not guarantee the `impacket-*` command names. A stale user-installed
+`impacket-ntlmrelayx` wrapper can disagree with an upgraded library; startup
+checks for the known `setRPCOptions` mismatch. `bloodhound-python` is the
+collector expected by this code, supplied by
+[bloodhound.py](https://www.kali.org/tools/bloodhound.py/).
+
+### Git repositories and tool discovery
+
+`/opt/tools` is hard-coded; there is no `--tools-dir` option. The core PoC and
+krbrelayx use that location directly. Most other helpers are looked up on
+`PATH` first, with repository-path fallbacks.
 
 ```bash
-pipx install coercer
-pipx install wsuks --system-site-packages
-```
+sudo mkdir -p /opt/tools
 
-### Other binaries
+# Required for full / exploit / dcsync
+sudo git clone https://github.com/mverschu/CVE-2025-33073 /opt/tools/CVE-2025-33073
 
-- `kerbrute` — grab the latest binary from
-  <https://github.com/ropnop/kerbrute/releases> — install to `/usr/local/bin/`
-- `userenum-cldap` — companion CLDAP NetLogon-ping enumerator (lives in
-  this repo as `userenum-cldap.py`; install to `/usr/local/bin/userenum-cldap`)
-- `asn1tools` — `pip install asn1tools` (CLDAP enum runtime dep)
-- `ntlmv1-multi` — optional, for `--phase ntlmv1`: converts a captured
-  NetNTLMv1 hash to the crack.sh `NTHASH:` / hashcat-14000 format. Clone
-  <https://github.com/evilmog/ntlmv1-multi> to `/opt/tools/ntlmv1-multi`.
-  Without it, ad-autopwn still saves the raw hash + crack.sh instructions.
-- `Responder` needs `aioquic` (`pip install aioquic`) and generated TLS certs
-  (`certs/gen-self-signed-cert.sh`) to actually capture — required for WPAD/LLMNR
-  and the `ntlmv1` downgrade. Kali's apt `responder` handles both; a git-cloned
-  Responder does not.
-- `cmc_addext.py` — **ESC1-CMC** engine, ships in this repo. Auto-discovered
-  when it sits next to `ad-autopwn.py`, or at `/opt/tools/cmc-addext/`. Third-party
-  tool by Mohamed Alzhrani (@0xmaz) — see [Author](#author). Needs
-  `impacket`, `cryptography`, `ldap3`, `requests` (see `requirements.txt`).
-
-### Quick install (all deps on Kali)
-
-```bash
-# APT packages
-sudo apt install python3 impacket-scripts netexec nmap hashcat tcpdump \
-  responder dsniff arp-scan certipy-ad bloodyad bloodhound.py \
-  smbclient atftp wimtools john seclists
-
-# All required repos
-for repo in mverschu/CVE-2025-33073 dirkjanm/krbrelayx \
-            Wh04m1001/DFSCoerce ShutdownRepo/ShadowCoerce \
-            ShutdownRepo/pywhisker dirkjanm/PKINITtools \
-            csandker/pxethiefy garrettfoster13/sccmhunter \
-            dirkjanm/mitm6 Hackndo/pyGPOAbuse \
-            Hackndo/WebclientServiceScanner almandin/Certihound; do
-  sudo git clone "https://github.com/$repo" "/opt/tools/$(basename $repo)"
+# Optional phase helpers
+for repo in dirkjanm/krbrelayx Wh04m1001/DFSCoerce ShutdownRepo/ShadowCoerce \
+            dirkjanm/PKINITtools csandker/pxethiefy \
+            garrettfoster13/sccmhunter Hackndo/pyGPOAbuse \
+            Hackndo/WebclientServiceScanner topotam/PetitPotam; do
+  sudo git clone "https://github.com/$repo" "/opt/tools/${repo##*/}"
 done
 
-# Python deps for repos that need them
-for repo in pywhisker PKINITtools sccmhunter pxethiefy mitm6 pyGPOAbuse Certihound; do
-  [ -f "/opt/tools/$repo/requirements.txt" ] && \
-    pip3 install --break-system-packages -r "/opt/tools/$repo/requirements.txt"
+# Install each cloned tool's Python requirements where supplied
+for repo in CVE-2025-33073 krbrelayx DFSCoerce ShadowCoerce PKINITtools \
+            pxethiefy sccmhunter pyGPOAbuse WebclientServiceScanner PetitPotam; do
+  if [ -f "/opt/tools/$repo/requirements.txt" ]; then
+    sudo python3 -m pip install --break-system-packages \
+      -r "/opt/tools/$repo/requirements.txt"
+  fi
 done
+```
 
-# Pipx packages
+Cloning does not install a tool. Follow each repository's installation instructions
+when it uses package metadata instead of `requirements.txt`, and check its
+Python version requirements. These upstream versions are not pinned here.
+
+| Repository / helper | Expected path or command |
+|---|---|
+| [krbrelayx](https://github.com/dirkjanm/krbrelayx) | `/opt/tools/krbrelayx/{krbrelayx.py,dnstool.py,printerbug.py}`; requires `impacket`, `ldap3` and `dnspython` |
+| DFSCoerce | `/opt/tools/DFSCoerce/dfscoerce.py` or `dfscoerce.py` / `DFSCoerce.py` on `PATH` |
+| ShadowCoerce | `/opt/tools/ShadowCoerce/shadowcoerce.py` or `shadowcoerce.py` / `ShadowCoerce.py` on `PATH` |
+| PetitPotam | `/opt/tools/PetitPotam/PetitPotam.py`; some call sites also look for `impacket-PetitPotam`, `PetitPotam.py`, or `/usr/share/doc/python3-impacket/examples/PetitPotam.py`. The dedicated DC-coercion helper only checks `impacket-PetitPotam` and the Impacket examples path; Coercer provides a later fallback. |
+| PKINITtools | `/opt/tools/PKINITtools/gettgtpkinit.py` or `gettgtpkinit.py` on `PATH`; requires its own dependencies, including `minikerberos` |
+| pxethiefy | `pxethiefy` or `/opt/tools/pxethiefy/pxethiefy.py`; manual TFTP extraction is the fallback |
+| sccmhunter | `sccmhunter` or `/opt/tools/sccmhunter/sccmhunter.py` |
+| pyGPOAbuse | `pygpoabuse.py` / `pygpoabuse` or `/opt/tools/pyGPOAbuse/pygpoabuse.py` |
+| WebclientServiceScanner | `webclientservicescanner` or `/opt/tools/WebclientServiceScanner/webclientservicescanner.py` |
+| pywhisker | `pywhisker` / `pywhisker.py` or `/opt/tools/pywhisker/pywhisker.py`; install the package to expose its command |
+| Optional `tgssub.py` | On `PATH` or `/opt/tools/tgssub/tgssub.py`; inline Impacket rewrite is the fallback |
+| Optional [ntlmv1-multi](https://github.com/evilmog/ntlmv1-multi) | `ntlmv1-multi`, `ntlmv1-multi.py`, `ntlmv1_multi.py`, or `/opt/tools/ntlmv1-multi/ntlmv1-multi.py`; without it the raw capture and recovery instructions are still saved |
+
+### Installable CLI packages
+
+Install these as the user who will invoke `sudo`:
+
+```bash
+pipx ensurepath
 pipx install coercer
+pipx install mitm6
 pipx install wsuks --system-site-packages
+pipx install certihound
+pipx install git+https://github.com/ShutdownRepo/pywhisker
+```
 
-# kerbrute (ropnop) binary
-sudo wget -q -O /usr/local/bin/kerbrute \
+[mitm6](https://github.com/dirkjanm/mitm6) and
+[CertiHound](https://pypi.org/project/certihound/) must expose their CLI commands;
+merely cloning them under `/opt/tools` is insufficient. CertiHound is maintained
+at [0x0Trace/certihound](https://github.com/0x0Trace/certihound). AD AutoPwn
+currently falls back to Certipy for
+NT-hash-only AD CS enumeration, irrespective of upstream CertiHound's auth support.
+
+At startup, AD AutoPwn adds the invoking user's `~/.local/bin` to `PATH` using
+`SUDO_USER`, so the usual pipx installation remains discoverable under `sudo`.
+Custom pipx binary directories must be added to `PATH` explicitly.
+
+### Standalone binary and bundled scripts
+
+Install [kerbrute](https://github.com/ropnop/kerbrute/releases) for your machine's
+architecture into `PATH`. For Linux AMD64, the existing v1.0.3 release can be
+installed with:
+
+```bash
+sudo wget -O /usr/local/bin/kerbrute \
   https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64
 sudo chmod +x /usr/local/bin/kerbrute
-
-# CLDAP userenum runtime dep
-sudo pip3 install --break-system-packages asn1tools
-
-# userenum-cldap companion script (this repo)
-sudo wget -q -O /usr/local/bin/userenum-cldap \
-  https://raw.githubusercontent.com/jonaslejon/ad-autopwn/main/userenum-cldap.py
-sudo chmod +x /usr/local/bin/userenum-cldap
-
-# ad-autopwn itself
-sudo cp ad-autopwn.py /usr/local/bin/ad-autopwn
-sudo chmod +x /usr/local/bin/ad-autopwn
 ```
 
-`check_prerequisites()` runs at the top of every invocation and prints
-a green ✅ / yellow ⚠️ status for every tool the script touches, with
-install hints for anything missing.
+From this checkout, install **all three bundled scripts** after installing
+`requirements.txt`:
+
+```bash
+sudo install -m 0755 ad-autopwn.py /usr/local/bin/ad-autopwn
+sudo install -m 0755 userenum-cldap.py /usr/local/bin/userenum-cldap
+sudo install -m 0755 cmc_addext.py /usr/local/bin/cmc_addext.py
+ad-autopwn --help
+```
+
+`userenum-cldap` must be executable on `PATH`; the discovery phase does not run
+the adjacent `.py` file automatically. `cmc_addext.py` is discovered on `PATH`,
+beside `ad-autopwn.py`, or at `/opt/tools/cmc-addext/cmc_addext.py`.
+
+A git-installed Responder also needs its Python dependencies (including
+`aioquic`) and TLS certificates generated with its
+`certs/gen-self-signed-cert.sh`. The previous lab runs used Kali's packaged
+Responder; see [L2_TEST_REPORT.md](L2_TEST_REPORT.md) for environment findings.
+
+NetExec module availability varies by installation. The enrichment battery
+uses LDAP modules `maq`, `laps`, `pre2k`, `get-desc-users`, `get-userPassword`,
+`dns-nonsecure`, `badsuccessor`, plus the LDAP **flag** `--gmsa`; SMB modules are
+`nopac`, `timeroast`, `zerologon`, `coerce_plus`, `backup_operator`,
+`printnightmare`, and `gpp_password`. Loot additionally uses `lsassy` after a
+best-effort availability check with `nxc smb -L`. Individual module failures are logged and do not stop
+the enrichment battery. Inventory the installed modules without contacting a
+target with `nxc ldap -L` and `nxc smb -L`.
+
+## Companion tools
+
+### userenum-cldap.py
+
+```text
+python3 userenum-cldap.py <DC-IP> <DNS-domain-FQDN> <userlist-file>
+```
+
+All three positional arguments are required. The input is one username per
+nonempty line; the standalone helper does not strip comment lines. It queries
+UDP 389 and writes `[+] <user> exists` for discovered users. It has no argparse
+options or dedicated `--help` mode. AD AutoPwn's wrapper limits its input to
+500 candidates and execution to 15 minutes; the standalone helper processes
+the supplied file with a five-second socket timeout per query.
+
+### cmc_addext.py
+
+This vendored helper has its own CLI, separate from `ad-autopwn.py`:
+
+```bash
+python3 cmc_addext.py --help
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `-h`, `--help` | — | Show help and exit. |
+| `--cert`, `--key` | unset | CA-issued signer certificate and private key in PEM format. |
+| `--auto-signer` | off | Enroll a signer via RPC; requires CA host/name and credentials instead of existing signer files. |
+| `--ces-url` | unset | CES SOAP endpoint; alternative to direct RPC submission. |
+| `--ca-host`, `--ca-name` | unset | CA host/IP and CA name for RPC mode. |
+| `--template` | auto-discover | Certificate template; LDAP discovery requires `--dc-ip` and `--dc-pass`. |
+| `--inject-upn` | unset | UPN to include in the SAN extension. |
+| `--inject-eku` | unset | Comma-separated EKU OIDs. |
+| `--inject-app-policies` | unset | Comma-separated Application Policies OIDs. |
+| `--inject-ca-cert` | off | Include CA basic constraints and certificate-signing key usages. |
+| `--inject-template` | unset | Template name for CMC added attributes. |
+| `--inject-userdn` | unset | User DN for CMC added attributes. |
+| `--inject-sid` | unset | Explicit SID; takes precedence over LDAP SID lookup. |
+| `--dc-ip` | unset | DC for LDAP SID lookup and template discovery. |
+| `--dc-user` | `administrator` | LDAP/RPC username. |
+| `--dc-pass` | unset | LDAP/RPC password. |
+| `--subject-cn` | `CMC Test` | Inner CSR subject CN. |
+| `--out` | `cmc_addext_loot.pfx` | Output PFX path. |
+| `--pfx-pass` | `addext` | Output PFX password. |
+| `--dump-cmc` | unset | Optional raw CMC DER output path. |
+
+Choose CES or RPC, provide `--cert` plus `--key` or `--auto-signer`, and select
+at least one of `--inject-upn`, `--inject-eku`, `--inject-app-policies`,
+`--inject-template`, or `--inject-ca-cert`. The helper's `--help` works after its
+Python dependencies are installed. See [Author](#author) for attribution.
+
+## Runtime behavior and output
+
+- **Automatic discovery:** omitted network values are inferred from local
+  routes/interfaces, DNS, LDAP and SMB probes. When the domain/DC are unknown,
+  discovery can try both the detected subnet and an attacker-IP-derived `/24`.
+  `-T` is phase-specific and is not a global scan boundary; `--exclude` currently
+  has no effect. Supply known domain/DC/network values to avoid unnecessary
+  discovery.
+- **Authentication:** authenticated phases generally use `-u` with a nonempty
+  `-p` or `-H`. An empty password does not make `Config.has_creds` true. Account
+  selectors ending in `$` should be quoted. Some external helpers need a
+  password even when the orchestrator accepts a hash.
+- **Discovery login attempts:** blank and username-as-password checks are on
+  by default, and pre2k tests also attempt authentication. `--spray-password`
+  adds another password test; the code does not query/enforce the domain's
+  lockout policy or track attempts across runs. `--no-weak-pw` suppresses only
+  its two named checks, so `discover` is not an enumeration-only phase.
+- **BloodHound:** `bloodhound` needs the domain, DC IP and DC FQDN. It performs
+  collection, local analysis and automatic ACL actions by default. Use
+  `--no-bh-auto-action` for collection and analysis alone.
+- **Reflection helpers:** the two `reflect-*` phases generate operator scripts
+  and start listeners; their source also calls out manual target-side work and relay patches. They are not complete,
+  unattended LPE implementations.
+- **Dry run:** attack commands through `run()` and the user-enumeration wrappers
+  are printed instead of executed, including background attack processes.
+  However, auto-discovery calls subprocesses directly and can still contact
+  the network; capability checks and output-file writes can also occur.
+  `--dry-run` is not an offline or side-effect-free mode. Use `--help` to inspect
+  the CLI without startup discovery.
+
+The default output directory is `./ad-autopwn-YYYYMMDD-HHMMSS`; set it with
+`-o` / `--output`. Prefer an **absolute path**, particularly for BloodHound and
+other tools that change their working directory. Output files are created
+according to the phases run and findings obtained:
+
+| Output | Contents |
+|---|---|
+| `chain.log` | File log, including debug command lines regardless of console verbosity |
+| `config.txt` | Run configuration and the original invocation |
+| `valid-users.txt`, `userenum-*.txt`, `weakpw-*.txt`, `spray-*.txt` | Discovery and authentication-check results |
+| `access-*.txt` | RDP/WinRM/Guest/share-access findings |
+| `nxc-*.txt`, `enrich-summary.txt`, `enrich-gpp.txt` | Enrichment results and extracted findings |
+| `bloodhound/`, `bloodhound-analysis.txt`, `admin-to-hosts.txt` | Collected graph data, analysis and local-admin targets |
+| `reset-creds.txt`, `loot-harvested-hashes.txt`, `loot-local-admins.txt`, `loot-pth-reuse.txt` | Reset credentials, recovered hashes and reuse results |
+| `loot-*.txt`, PFX/ccache files, hash files and phase-specific directories | Detailed tool output and collected artifacts |
+
+`config.txt` records the full command line and `chain.log` records commands and
+findings, so these files can contain supplied passwords/hashes as well as
+recovered secrets. Output permissions follow the invoking user's umask.
 
 ## Tested against
 
@@ -378,16 +738,20 @@ welcome — open an issue or PR.
   permission and that the targets and techniques are within the agreed scope.
   `--acknowledge-risk` bypasses the interactive prompt for approved automation;
   it does not suppress the production-use warning.
-- `--dry-run` prints every command (foreground **and** background) without
-  executing and skips the confirmation prompt — it won't spawn ARP spoofers,
-  mitm6, Responder, or ntlmrelayx.
+- `--dry-run` skips the confirmation prompt and attack-process launches, but
+  startup discovery can still probe the network and local files can be written;
+  see [Runtime behavior](#runtime-behavior-and-output).
 - ESC4 template modifications are wrapped in `try/finally` with `os.chdir`
   to ensure restore lands in the right directory on any exit path.
 - AD CS / RBCD / ghost-SPN chains attempt cleanup of planted records on
   completion (DNS records, Trusted-For-Delegation UAC bits, ghost SPNs).
   Machine accounts you create stay in AD — see operator notes in the
   run output for cleanup commands.
-- `--no-cleanup` keeps everything for forensic review.
+- `--no-cleanup` suppresses selected record/ACL cleanup only. It does not keep
+  background processes alive, prevent WSUS firewall-rule removal, or disable
+  ESC4 template / ESC9–ESC10 UPN restoration. Password resets, group changes,
+  created accounts and some other modifications need operator review and manual
+  cleanup; follow the instructions printed by the relevant phase.
 
 ## Disclaimer
 
