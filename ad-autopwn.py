@@ -228,6 +228,7 @@ class Config:
     phase: str = "full"
     dry_run: bool = False
     verbose: bool = False
+    acknowledge_risk: bool = False
     work_dir: Path = field(default_factory=lambda: Path("."))
 
     # State
@@ -390,16 +391,58 @@ def separator():
 
 def banner():
     print(f"""{C.BOLD_RED}
-       _   ___      _       _       ___
-      /_\\ |   \\    /_\\ _  _| |_ ___| _ \\__ __ ___ _
-     / _ \\| |) |  / _ \\ || |  _/ _ \\  _/\\ V  V / ' \\
-    /_/ \\_\\___/  /_/ \\_\\_,_|\\__\\___/_|   \\_/\\_/|_||_|
+        _    ____       _         _        ____
+       / \\  |  _ \\     / \\  _   _| |_ ___ |  _ \\__      ___ __
+      / _ \\ | | | |   / _ \\| | | | __/ _ \\| |_) \\ \\ /\\ / / '_ \\
+     / ___ \\| |_| |  / ___ \\ |_| | || (_) |  __/ \\ V  V /| | | |
+    /_/   \\_\\____/  /_/   \\_\\__,_|\\__\\___/|_|     \\_/\\_/ |_| |_|
 {C.NC}""")
     print(f"{C.BOLD_CYAN}    ⚡ Zero-Auth to Domain Admin — Attack Chain{C.NC}")
     print(f"{C.DIM}    ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast | gMSA | NetNTLMv1 | RBCD | DCSync{C.NC}")
     print(f"{C.DIM}    🔧 v{VERSION} | Triop AB | Authorized testing only{C.NC}")
     print(f"{C.DIM}    📋 Full log: <work_dir>/chain.log{C.NC}\n")
     separator()
+
+
+def confirm_authorized_use(cfg: Config) -> bool:
+    """Require an explicit authorization acknowledgement before live use."""
+    print(f"""
+{C.BOLD_RED}⚠️  AUTHORIZED TESTING ONLY{C.NC}
+
+This tool must NEVER be run in a production environment.
+
+Continue only if you have explicit written permission from the system owner,
+the targets and techniques are covered by the agreed scope, and you understand
+that this tool may poison network traffic, modify Active Directory, disrupt
+systems, and expose credentials.
+""")
+
+    if cfg.dry_run:
+        detail("Dry-run mode: authorization prompt skipped; no commands will execute")
+        return True
+
+    if cfg.acknowledge_risk:
+        log.warning("Risk and authorization prompt bypassed with --acknowledge-risk")
+        return True
+
+    if not sys.stdin.isatty():
+        log.error("Interactive authorization confirmation requires a terminal")
+        log.error("For approved automation, pass --acknowledge-risk")
+        return False
+
+    try:
+        response = input("Do you have written permission and want to continue? [y/N]: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        log.warning("Authorization not confirmed — exiting")
+        return False
+
+    if response.strip().lower() in {"y", "yes"}:
+        ok("Authorization and scope acknowledged")
+        return True
+
+    log.warning("Authorization not confirmed — exiting")
+    return False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -9957,6 +10000,10 @@ def parse_args() -> Config:
                                    "reflect-tcpport", "reflect-loopback", "kerb-reflect"],
                           help="Run a single phase")
     run_opts.add_argument("--dry-run", action="store_true", help="Print commands only")
+    run_opts.add_argument(
+        "--acknowledge-risk", action="store_true",
+        help="Confirm written authorization and bypass the interactive safety prompt",
+    )
     run_opts.add_argument("-v", "--verbose", action="store_true", help="Debug output")
     run_opts.add_argument("-o", "--output", default="", help="Output directory")
 
@@ -10027,6 +10074,7 @@ def parse_args() -> Config:
         phase=args.phase,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        acknowledge_risk=args.acknowledge_risk,
     )
 
     if args.output:
@@ -10040,6 +10088,9 @@ def parse_args() -> Config:
 def main():
     cfg = parse_args()
     banner()
+
+    if not confirm_authorized_use(cfg):
+        sys.exit(2)
 
     # sudo strips ~/.local/bin from PATH, hiding pipx tools (mitm6, coercer,
     # wsuks, bloodyAD, sccmhunter) from both detection AND execution. Add the

@@ -7,10 +7,11 @@ techniques to compromise Active Directory environments. Designed for
 authorized security assessments.
 
 ```
-       _   ___      _       _       ___
-      /_\ |   \    /_\ _  _| |_ ___| _ \__ __ ___ _
-     / _ \| |) |  / _ \ || |  _/ _ \  _/\ V  V / ' \
-    /_/ \_\___/  /_/ \_\_,_|\__\___/_|   \_/\_/|_||_|
+    _    ____       _         _        ____
+   / \  |  _ \     / \  _   _| |_ ___ |  _ \__      ___ __
+  / _ \ | | | |   / _ \| | | | __/ _ \| |_) \ \ /\ / / '_ \
+ / ___ \| |_| |  / ___ \ |_| | || (_) |  __/ \ V  V /| | | |
+/_/   \_\____/  /_/   \_\__,_|\__\___/|_|     \_/\_/ |_| |_|
 
     ⚡ Zero-Auth to Domain Admin — Attack Chain
     Discover | Sniff | ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast
@@ -109,9 +110,17 @@ authorized security assessments.
 
 ## Usage
 
+Every live run displays a production-use warning and requires interactive
+confirmation that you have written permission and an agreed scope. Approved
+non-interactive automation can bypass the prompt with `--acknowledge-risk`.
+The warning is still displayed.
+
 ```bash
-# Fully automated — zero-cred chain (auto-discovers everything)
+# Fully automated — zero-cred chain (prompts for authorization)
 sudo ./ad-autopwn.py
+
+# Approved non-interactive/lab automation
+sudo ./ad-autopwn.py --acknowledge-risk
 
 # With credentials — full chain
 ./ad-autopwn.py -u jsmith -p 'P@ss123' -d corp.local --dc-ip 10.0.0.1
@@ -370,8 +379,13 @@ welcome — open an issue or PR.
 
 ## Safety
 
+- Live runs require a `y/N` confirmation that the operator has explicit written
+  permission and that the targets and techniques are within the agreed scope.
+  `--acknowledge-risk` bypasses the interactive prompt for approved automation;
+  it does not suppress the production-use warning.
 - `--dry-run` prints every command (foreground **and** background) without
-  executing — won't spawn ARP spoofers, mitm6, Responder, or ntlmrelayx.
+  executing and skips the confirmation prompt — it won't spawn ARP spoofers,
+  mitm6, Responder, or ntlmrelayx.
 - ESC4 template modifications are wrapped in `try/finally` with `os.chdir`
   to ensure restore lands in the right directory on any exit path.
 - AD CS / RBCD / ghost-SPN chains attempt cleanup of planted records on
@@ -387,6 +401,11 @@ welcome — open an issue or PR.
 This tool is designed for use by security professionals during
 authorized engagements. Unauthorized access to computer systems is
 illegal. Always obtain written permission before testing.
+
+## Acknowledgements
+
+Thanks to [AJ Hammond](https://www.linkedin.com/in/aj-hammond/) for the feedback
+that prompted the clearer banner and mandatory authorization warning.
 
 ## Author
 
