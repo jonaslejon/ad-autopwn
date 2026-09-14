@@ -426,7 +426,7 @@ All credit for that technique and code goes to the original author.
 
 ## License
 
-MIT — applies to ad-autopwn's own code (`ad-autopwn.py`, `userenum-cldap.py`).
+[MIT](LICENSE) — applies to ad-autopwn's own code (`ad-autopwn.py`, `userenum-cldap.py`).
 
 `cmc_addext.py` is redistributed as-is from its upstream repository, which
 publishes no explicit license. Its copyright remains with Mohamed Alzhrani
