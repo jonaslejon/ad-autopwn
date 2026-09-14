@@ -11,17 +11,7 @@ A fully automated penetration testing tool that chains 25+ attack
 techniques to compromise Active Directory environments. Designed for
 authorized security assessments.
 
-```
-    _    ____       _         _        ____
-   / \  |  _ \     / \  _   _| |_ ___ |  _ \__      ___ __
-  / _ \ | | | |   / _ \| | | | __/ _ \| |_) \ \ /\ / / '_ \
- / ___ \| |_| |  / ___ \ |_| | || (_) |  __/ \ V  V /| | | |
-/_/   \_\____/  /_/   \_\__,_|\__\___/|_|     \_/\_/ |_| |_|
-
-    ⚡ Zero-Auth to Domain Admin — Attack Chain
-    Discover | Sniff | ARP | WPAD | WSUS | PXE | AD CS | SCCM | Roast
-    gMSA | NetNTLMv1 | BloodHound | Reflect | Loot | RBCD+KCD | DCSync | DPAPI
-```
+![AD AutoPwn social preview](assets/social-preview.png)
 
 ## Features
 
