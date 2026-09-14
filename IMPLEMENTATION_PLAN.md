@@ -205,10 +205,17 @@ full-auto both run it). Read-only; findings → `access-*.txt`.
 - **`--dry-run` first** on every new phase — assert the emitted command lines are correct before
   any live fire (this is how the repo already validates L2 paths per the README's "Needs more
   testing" section).
-- **GOAD / GOAD-Light** on AWS is the existing lab (README "Tested against"). It ships MSSQL
-  (`sql.north.sevenkingdoms.local`) and multiple DCs → M1 (MSSQL) and M2 (ACL edges) are fully
-  testable there. RODC (M3) and forest trusts (M6) may need **full GOAD** (not Light) or a
-  nested-virt lab; note that in the PR like the existing "Needs more testing" section.
+- **GOAD / GOAD-Light on AWS** provides the existing cloud/routed-network baseline (README
+  "Tested against"). It ships multiple DCs and remains useful for validating functionality that
+  does not require Layer-2 access.
+- **GOAD on the Proxmox cluster** is the second live test environment and the preferred lab for
+  Layer-2 paths that AWS cannot expose (ARP, WPAD/LLMNR, DHCPv6, WSUS, and PXE). Before each
+  test, confirm that the attacker VM and targets share the intended bridge/VLAN and that the
+  exact topology is isolated from production networks.
+- Use the Proxmox GOAD deployment for RODC (M3) and forest-trust (M6) validation when those roles
+  are present. If the current topology lacks an RODC or multi-forest trust, add an isolated test
+  role/topology rather than treating an untestable path as verified. Record which environment,
+  GOAD variant, network segment, and topology were used in the PR or test report.
 - Unit-test the pure parsers (priv-enum output, trust enumeration, share-ACL classification) the
   way `_parse_netntlmv1` / `_parse_gmsa_hashes` are structured — no network needed.
 
@@ -220,7 +227,7 @@ full-auto both run it). Read-only; findings → `access-*.txt`.
 | ✅ | **M4 — Initial-access wins** | S | Done (PRs #6/#7/#8). |
 | ✅ | **M5 — Surface findings** | S–M | Done (PR #9). |
 | ❌ | **M1 — MSSQL suite** | — | Descoped (owner decision). |
-| 1 | **M3 — RODC suite** | M | Self-contained; needs full-GOAD to validate. |
+| 1 | **M3 — RODC suite** | M | Self-contained; validate on Proxmox GOAD with an RODC role. |
 | 2 | **M6 — Trust / groups / CVEs / ESC17** | S–M | Mostly detections; finish the long tail. |
 
 M2/M4/M5 are shipped and merged. Remaining: **M3 (RODC)** and **M6 (long tail)**.
