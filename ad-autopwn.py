@@ -263,14 +263,14 @@ class Config:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("cleanup: suppressed non-fatal exception", exc_info=True)
             # Close tracked file handles
             try:
                 fh = getattr(proc, '_outfile', None)
                 if fh and fh != subprocess.DEVNULL:
                     fh.close()
             except Exception:
-                pass
+                log.debug("cleanup: suppressed non-fatal exception", exc_info=True)
         self.bg_processes.clear()
 
 
@@ -600,7 +600,7 @@ def _extra_tool_dirs() -> list[str]:
             import pwd
             homes.append(pwd.getpwnam(sudo_user).pw_dir)
         except (KeyError, ImportError):
-            pass
+            log.debug("_extra_tool_dirs: suppressed non-fatal exception", exc_info=True)
     homes.append(os.path.expanduser("~"))
     for h in homes:
         dirs.append(os.path.join(h, ".local", "bin"))
@@ -703,7 +703,7 @@ class AutoDiscovery:
                         self._set("iface", parts[idx], "default route")
                         return
         except Exception:
-            pass
+            log.debug("_detect_interface: suppressed non-fatal exception", exc_info=True)
         log.warning("Could not detect network interface")
 
     def _detect_attacker_ip(self):
@@ -719,7 +719,7 @@ class AutoDiscovery:
                 self._set("attacker_ip", m.group(1), f"interface {self.cfg.iface}")
                 return
         except Exception:
-            pass
+            log.debug("_detect_attacker_ip: suppressed non-fatal exception", exc_info=True)
         # Fallback: from interface
         if self.cfg.iface:
             try:
@@ -732,7 +732,7 @@ class AutoDiscovery:
                     self._set("attacker_ip", m.group(1), self.cfg.iface)
                     return
             except Exception:
-                pass
+                log.debug("_detect_attacker_ip: suppressed non-fatal exception", exc_info=True)
         log.error("Could not detect attacker IP — specify with -a")
 
     def _detect_gateway(self):
@@ -748,7 +748,7 @@ class AutoDiscovery:
                 self._set("gateway", m.group(1), "default route")
                 return
         except Exception:
-            pass
+            log.debug("_detect_gateway: suppressed non-fatal exception", exc_info=True)
         if self.cfg.dc_ip:
             self.cfg.gateway = self.cfg.dc_ip
             log.warning(f"Gateway: {self.cfg.dc_ip} (using DC IP as fallback)")
@@ -770,7 +770,7 @@ class AutoDiscovery:
                     self._set("target_net", net, self.cfg.iface)
                     return
             except Exception:
-                pass
+                log.debug("_detect_subnet: suppressed non-fatal exception", exc_info=True)
         log.error("Could not detect target subnet — specify with -t")
 
     def _detect_dc_via_scan(self):
@@ -801,7 +801,7 @@ class AutoDiscovery:
                 if wider not in ranges:
                     ranges.append(wider)
             except Exception:
-                pass
+                log.debug("_detect_dc_via_scan: suppressed non-fatal exception", exc_info=True)
 
         for net_str in ranges:
             try:
@@ -906,7 +906,7 @@ class AutoDiscovery:
                         self._set("domain", dom, "reverse DNS")
                         return
             except Exception:
-                pass
+                log.debug("_detect_domain: suppressed non-fatal exception", exc_info=True)
 
         # Method 3: LDAP rootDSE query against DC (zero-auth)
         if self.cfg.dc_ip:
@@ -923,7 +923,7 @@ class AutoDiscovery:
                     self._set("domain", dom, "LDAP rootDSE")
                     return
             except Exception:
-                pass
+                log.debug("_detect_domain: suppressed non-fatal exception", exc_info=True)
 
         # Method 4: SMB null session (nxc)
         if self.cfg.dc_ip and tool_exists("nxc"):
@@ -940,7 +940,7 @@ class AutoDiscovery:
                         self._set("domain", dom, "SMB null session")
                         return
             except Exception:
-                pass
+                log.debug("_detect_domain: suppressed non-fatal exception", exc_info=True)
 
         log.error("Could not detect domain — specify with -d")
 
@@ -1023,7 +1023,7 @@ class AutoDiscovery:
                     self._set("dc_fqdn", fqdn, "reverse DNS")
                     return
             except Exception:
-                pass
+                log.debug("_detect_dc_fqdn: suppressed non-fatal exception", exc_info=True)
         # nxc fingerprint
         if tool_exists("nxc"):
             try:
@@ -1036,7 +1036,7 @@ class AutoDiscovery:
                     self._set("dc_fqdn", f"{m.group(1)}.{domain}", "nxc SMB")
                     return
             except Exception:
-                pass
+                log.debug("_detect_dc_fqdn: suppressed non-fatal exception", exc_info=True)
         # Guess
         self.cfg.dc_fqdn = f"DC.{domain}"
         log.warning(f"DC FQDN: {self.cfg.dc_fqdn} (guessed — override with --dc-fqdn)")
@@ -1476,7 +1476,7 @@ def arp_spoof_relay(target: str, cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("arp_spoof_relay: suppressed non-fatal exception", exc_info=True)
         # Remove from global bg list
         for proc in bg_procs:
             if proc in cfg.bg_processes:
@@ -1485,7 +1485,7 @@ def arp_spoof_relay(target: str, cfg: Config) -> bool:
         try:
             Path("/proc/sys/net/ipv4/ip_forward").write_text(old_forward)
         except Exception:
-            pass
+            log.debug("arp_spoof_relay: suppressed non-fatal exception", exc_info=True)
 
 
 def extract_hashes(cfg: Config) -> list[str]:
@@ -1860,7 +1860,7 @@ def enumerate_targets(cfg: Config) -> tuple[list[str], list[str]]:
                     ok(f"🎯 HIGH VALUE: {dh} ({ip}) — relay + unconstrained delegation")
                     high_value.append(ip)
             except Exception:
-                pass
+                log.debug("enumerate_targets: suppressed non-fatal exception", exc_info=True)
 
     if high_value:
         (cfg.work_dir / "high-value-targets.txt").write_text("\n".join(high_value) + "\n")
@@ -1970,7 +1970,7 @@ def exploit_target(target: str, cfg: Config) -> bool:
                 if rev:
                     target_fqdn = rev.splitlines()[0]
             except Exception:
-                pass
+                log.debug("exploit_target: suppressed non-fatal exception", exc_info=True)
         if run_kerberos_reflection(target_fqdn, cfg):
             (cfg.work_dir / f"working-method-{target}.txt").write_text("unicode-spn")
             return True
@@ -2194,7 +2194,7 @@ def dcsync_attack(already_exploited: str, cfg: Config):
             try:
                 relay_proc.kill()
             except Exception:
-                pass
+                log.debug("dcsync_attack: suppressed non-fatal exception", exc_info=True)
         if relay_proc in cfg.bg_processes:
             cfg.bg_processes.remove(relay_proc)
 
@@ -2417,7 +2417,7 @@ def _collect_ntlmv1_captures(cfg: Config, responder_out: Path) -> list[tuple[str
                     if logf.stat().st_mtime >= cfg.start_time:
                         text += "\n" + logf.read_text(errors="replace")
                 except Exception:
-                    pass
+                    log.debug("_collect_ntlmv1_captures: suppressed non-fatal exception", exc_info=True)
     return _parse_netntlmv1(text)
 
 
@@ -2547,7 +2547,7 @@ def _machine_hash_self_takeover(account: str, nthash: str, cfg: Config) -> bool:
         try:
             shutil.copy2(str(cfg.work_dir / m.group(1)), str(ccache))
         except Exception:
-            pass
+            log.debug("_machine_hash_self_takeover: suppressed non-fatal exception", exc_info=True)
         success_box(f"NetNTLMv1: local admin on {spn_host}!")
         detail(f"export KRB5CCNAME={ccache}")
         detail(f"impacket-psexec -k -no-pass {spn_host}")
@@ -2711,7 +2711,7 @@ def run_ntlmv1_downgrade(cfg: Config) -> bool:
             try:
                 resp_proc.kill()
             except Exception:
-                pass
+                log.debug("run_ntlmv1_downgrade: suppressed non-fatal exception", exc_info=True)
         if resp_proc in cfg.bg_processes:
             cfg.bg_processes.remove(resp_proc)
         if conf:
@@ -4074,7 +4074,7 @@ def run_wpad_attack(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_wpad_attack: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -4340,7 +4340,7 @@ def run_wsus_relay(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_wsus_relay: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -4355,7 +4355,7 @@ def run_wsus_relay(cfg: Config) -> bool:
         try:
             Path("/proc/sys/net/ipv4/ip_forward").write_text(old_forward)
         except Exception:
-            pass
+            log.debug("run_wsus_relay: suppressed non-fatal exception", exc_info=True)
 
 
 def run_wsus_inject(cfg: Config) -> bool:
@@ -5490,7 +5490,7 @@ def run_ntlm_theft(cfg: Config) -> bool:
             )
             ntlmrelayx_running = check.returncode == 0
         except Exception:
-            pass
+            log.debug("run_ntlm_theft: suppressed non-fatal exception", exc_info=True)
 
         if ntlmrelayx_running:
             log.info("ntlmrelayx already running — relying on it for hash capture")
@@ -5549,7 +5549,7 @@ def run_ntlm_theft(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_ntlm_theft: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -6005,7 +6005,7 @@ def _adcs_relay_esc8(ca_host: str, cfg: Config) -> Optional[str]:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("_adcs_relay_esc8: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -6409,7 +6409,7 @@ def run_webdav_coercion(target: str, cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_webdav_coercion: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
@@ -6544,7 +6544,7 @@ def run_dhcp_coercion(cfg: Config) -> bool:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    log.debug("run_dhcp_coercion: suppressed non-fatal exception", exc_info=True)
         for proc in bg_procs:
             if proc in cfg.bg_processes:
                 cfg.bg_processes.remove(proc)
